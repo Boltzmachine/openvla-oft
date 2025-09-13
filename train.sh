@@ -1,13 +1,13 @@
-torchrun --standalone --nnodes 1 --nproc-per-node 4 vla-scripts/finetune.py \
+torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
   --vla_path openvla/openvla-7b \
   --data_root_dir dataset/ \
-  --dataset_name libero_spatial_no_noops \
+  --dataset_name libero_10_no_noops \
   --run_root_dir outputs/ \
-  --use_l1_regression True \
+  --use_l1_regression False \
   --use_diffusion False \
   --use_film False \
-  --num_images_in_input 2 \
-  --use_proprio True \
+  --num_images_in_input 1 \
+  --use_proprio False \
   --batch_size 4 \
   --learning_rate 5e-4 \
   --num_steps_before_decay 100000 \
