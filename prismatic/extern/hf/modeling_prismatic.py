@@ -627,6 +627,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
             # Build labels for multimodal sequence if needed
             multimodal_labels = self._build_multimodal_labels(labels, projected_patch_embeddings)
+            action_token_mask = torch.cat([all_actions_mask[:, :1], torch.zeros(projected_patch_embeddings.size(0), projected_patch_embeddings.size(1), 1, device=all_actions_mask.device, dtype=all_actions_mask.dtype), all_actions_mask[:, 1:]], dim=1)
 
             # Dispatch to language model
             language_model_output = self.language_model(
@@ -636,6 +637,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 past_key_values=None,
                 inputs_embeds=multimodal_embeddings,
                 labels=multimodal_labels,
+                action_token_mask=action_token_mask,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
