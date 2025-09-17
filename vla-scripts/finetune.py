@@ -1103,6 +1103,8 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Store recent train metrics
             for metric_name, value in metrics.items():
+                if metric_name not in recent_metrics:
+                    recent_metrics[metric_name] = deque(maxlen=cfg.grad_accumulation_steps)
                 if metric_name in recent_metrics:
                     recent_metrics[metric_name].append(value)
 
