@@ -447,7 +447,7 @@ def run_forward_pass(
         static, other_static = static_features
         if 'indices' in static:
             static_acc = (static['indices'] == other_static['indices']).float().mean(1)
-            metrics['static_acc'] = static_acc.detach().item()
+            metrics['static_acc'] = static_acc.mean().item()
 
         if "dists" in static:
             raise
@@ -464,7 +464,7 @@ def run_forward_pass(
             pair_logits.diagonal().copy_(positive_logits)
             nce_loss = F.cross_entropy(pair_logits, torch.arange(len(query), device=query.device))
             metrics['nce_loss'] = nce_loss.item()
-            loss = loss + nce_loss
+            loss = loss + 0.01 * nce_loss
             
         if 'commit_loss' in static:
             raise
@@ -1070,6 +1070,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
+
+    # wandb.watch(vla, log="all", log_freq=100)
 
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
