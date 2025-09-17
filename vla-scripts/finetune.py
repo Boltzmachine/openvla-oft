@@ -15,10 +15,12 @@ import draccus
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import tqdm
 from accelerate import PartialState
 from huggingface_hub import HfApi, snapshot_download
 from peft import LoraConfig, PeftModel, get_peft_model
+from peft.tuners.tuners_utils import _maybe_include_all_linear_layers
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
@@ -64,9 +66,12 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+def vector_normalize(*xs):
+    return [None if x is None else F.normalize(x, dim=-1) for x in xs]
 
 @dataclass
 class FinetuneConfig:
+    disentangle: bool = False
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
@@ -337,6 +342,7 @@ def run_forward_pass(
             noisy_action_projector=noisy_action_projector if use_diffusion else None,
             diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
             use_film=use_film,
+            other_pixel_values=batch.get("other_pixel_values", None)
         )
 
     # Get action masks needed for logging
@@ -437,6 +443,35 @@ def run_forward_pass(
                 }
             )
 
+    if static_features := output.get('static_features', None):
+        static, other_static = static_features
+        if 'indices' in static:
+            static_acc = (static['indices'] == other_static['indices']).float().mean(1)
+            metrics['static_acc'] = static_acc.detach().item()
+
+        if "dists" in static:
+            raise
+            static_consistent_loss = 0.05 * (nn.functional.cross_entropy(static['dists'].view(-1, static['dists'].size(-1)), other_static['indices'].view(-1)) + nn.functional.cross_entropy(other_static['dists'].view(-1, static['dists'].size(-1)), static['indices'].view(-1)))
+        #     # static_consistent_loss = nn.functional.l1_loss(static['features_cont'], other_static['features_cont'])
+        #     # static_consistent_loss = nn.functional.kl_div(other_static['logprobs'], static['logprobs'], log_target=True)
+            metrics['static_consistent_loss'] = static_consistent_loss.detach()
+            loss = loss + static_consistent_loss
+
+        if 'pooling' in static:
+            query, positive = vector_normalize(static['pooling'], other_static['pooling']) # (B, F)
+            positive_logits = (query * positive).sum(1) # (B)
+            pair_logits = query @ query.T #(B, B)
+            pair_logits.diagonal().copy_(positive_logits)
+            nce_loss = F.cross_entropy(pair_logits, torch.arange(len(query), device=query.device))
+            metrics['nce_loss'] = nce_loss.item()
+            loss = loss + nce_loss
+            
+        if 'commit_loss' in static:
+            raise
+            commit_loss = 0.5 * (static['commit_loss'] + other_static['commit_loss'])
+            metrics['commit_loss'] = commit_loss.detach()
+            loss = loss + commit_loss
+
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
     return loss, metrics
 
@@ -511,6 +546,7 @@ def run_diffusion_sampling(
                 noisy_action_projector=noisy_action_projector,
                 diffusion_timestep_embeddings=diffusion_timestep_embeddings,
                 use_film=use_film,
+                other_pixel_values=batch.get("other_pixel_values", None)
             )
             # Get last layer hidden states
             last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
@@ -839,6 +875,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         trust_remote_code=True,
     ).to(device_id)
 
+    modules_to_save = []
+    if cfg.disentangle:
+        vla.patch_projector()
+        modules_to_save += ["action_predictor", "disentangle_adapter", "attn_pooler"]
+
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
@@ -850,7 +891,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             lora_dropout=cfg.lora_dropout,
             target_modules="all-linear",
             init_lora_weights="gaussian",
+            modules_to_save=modules_to_save,
         )
+        # lora_config = _maybe_include_all_linear_layers(lora_config, vla)
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 

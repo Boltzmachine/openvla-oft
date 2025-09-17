@@ -255,6 +255,7 @@ def apply_trajectory_transforms(
     goal_relabeling_strategy: Optional[str] = None,
     goal_relabeling_kwargs: dict = {},
     window_size: int = 1,
+    backward_observation_window_size: int = 1,
     future_action_window_size: int = 0,
     subsample_length: Optional[int] = None,
     skip_unlabeled: bool = False,
@@ -334,6 +335,7 @@ def apply_trajectory_transforms(
         partial(
             traj_transforms.chunk_act_obs,
             window_size=window_size,
+            backward_observation_window_size=backward_observation_window_size,
             future_action_window_size=future_action_window_size,
         ),
         num_parallel_calls,

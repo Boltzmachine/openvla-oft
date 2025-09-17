@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple, Type
 
 import numpy as np
+import random
 import torch
 from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
@@ -37,6 +38,9 @@ class RLDSBatchTransform:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        if len(rlds_batch["observation"]["image_primary"]) > 1:
+            selected_index = random.randint(0, len(rlds_batch["observation"]["image_primary"]) - 1)
+            other_img = Image.fromarray(rlds_batch["observation"]["image_primary"][selected_index])
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
         actions = rlds_batch["action"]
 
@@ -67,16 +71,19 @@ class RLDSBatchTransform:
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
         pixel_values = self.image_transform(img)
+        if other_img is not None:
+            other_pixel_values = self.image_transform(other_img)
 
         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
         labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+        return_dict = dict(pixel_values=pixel_values, other_pixel_values=other_pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
 
         # Add additional inputs
         if self.use_wrist_image:
+            raise
             all_wrist_pixels = []
             for k in rlds_batch["observation"].keys():
                 if "wrist" in k:
@@ -130,6 +137,7 @@ class RLDSDataset(IterableDataset):
         rlds_config = dict(
             traj_transform_kwargs=dict(
                 window_size=1,                                      # If we wanted to feed / predict more than one step
+                backward_observation_window_size=10,
                 future_action_window_size=NUM_ACTIONS_CHUNK-1,      # For action chunking
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused

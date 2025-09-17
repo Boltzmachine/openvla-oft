@@ -102,6 +102,7 @@ class PaddedCollatorForActionPrediction:
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         pixel_values = [instance["pixel_values"] for instance in instances]
+        other_pixel_values = [instance["other_pixel_values"] for instance in instances] if "other_pixel_values" in instances[0] else None
         if "dataset_name" in instances[0]:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
@@ -125,12 +126,16 @@ class PaddedCollatorForActionPrediction:
         # Stack all `pixel_values` --> depending on type is torch.Tensor or Dict[str, torch.Tensor]
         if isinstance(pixel_values[0], torch.Tensor):
             if "pixel_values_wrist" in instances[0]:
+                raise
                 pixel_values_wrist = [instance["pixel_values_wrist"] for instance in instances]
                 pixel_values = torch.cat((torch.stack(pixel_values), torch.stack(pixel_values_wrist)), dim=1)
             else:
                 pixel_values = torch.stack(pixel_values)
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
+
+        if other_pixel_values is not None:
+            other_pixel_values = torch.stack(other_pixel_values)
 
         # Stack all actions
         actions = [torch.from_numpy(np.copy(instance["actions"])) for instance in instances]
@@ -145,6 +150,7 @@ class PaddedCollatorForActionPrediction:
 
         output = dict(
             pixel_values=pixel_values,
+            other_pixel_values=other_pixel_values,
             proprio=proprio,
             input_ids=input_ids,
             attention_mask=attention_mask,

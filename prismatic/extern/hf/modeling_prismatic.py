@@ -20,6 +20,8 @@ import transformers
 from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+import random
+from vla_modules import DisentangleAdapter, ActionPredictor, AttentionPooling
 
 from prismatic.training.train_utils import (
     get_current_action_mask,
@@ -275,6 +277,7 @@ class PrismaticCausalLMOutputWithPast(ModelOutput):
 
     # Additions for VLMs
     projector_features: Optional[torch.FloatTensor] = None
+    static_features: Optional[Tuple[torch.FloatTensor]] = None
 
 
 class PrismaticPreTrainedModel(PreTrainedModel):
@@ -356,9 +359,24 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.pad_token_id = config.pad_token_id
         self.llm_dim = config.text_config.hidden_size
 
+        if getattr(config, "use_disentangle_adapter", False):
+            self.patch_projector()
+
         # HF Boilerplate =>> initializes weights via `_init_weights()` and sets gradient checkpointing
         self.post_init()
 
+    @property
+    def n_static_tokens(self):
+        if hasattr(self, 'disentangle_adapter'):
+            return self.disentangle_adapter.static_dim
+        return None
+                
+    def patch_projector(self):
+        self.disentangle_adapter = DisentangleAdapter(hidden_dim=4096, quantizer="none").to(self.language_model.device)
+        self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
+
+        return self
+    
     # === `PreTrainedModel` Boilerplate ===
     def get_input_embeddings(self) -> nn.Module:
         return self.language_model.get_input_embeddings()
@@ -444,7 +462,13 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             patch_features = self.vision_backbone(pixel_values)  # (bsz, 256 * num_images, D)
 
         # Project patch embeddings into language embedding space
-        return self.projector(patch_features)
+        patch_features = self.projector(patch_features)
+
+        if hasattr(self, 'disentangle_adapter'):
+            static_features, dynamic_features = self.disentangle_adapter(patch_features)
+            return static_features, dynamic_features
+        else:
+            return patch_features
 
     def _process_proprio_features(self, projected_patch_embeddings, proprio, proprio_projector):
         """Process proprioceptive features and append to vision features"""
@@ -515,6 +539,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
         use_film: bool = False,
+        other_pixel_values: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -582,8 +607,27 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 input_embeddings.shape[0], -1, input_embeddings.shape[2]
             )  # (B, lang_seq_len, llm_dim)
 
+            if other_pixel_values is not None:
+                assert not use_film
+                # selected_future_index = torch.randint(0, other_pixel_values.size(1), (1,)).item()
+                other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film)
+                if isinstance(other_image_features, tuple):
+                    other_static, other_dynamic = other_image_features
+
             # Get visual features
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            if isinstance(projected_patch_embeddings, tuple):
+                static, dynamic = projected_patch_embeddings
+                if hasattr(self, "attn_pooler") and other_pixel_values is not None:
+                    static['pooling'] = self.attn_pooler(static['features'])
+                    other_static['pooling'] = self.attn_pooler(other_static['features'])
+                if other_pixel_values is not None:
+                    if random.random() < 0.5:
+                        projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+                    else:
+                        projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
+                else:
+                    projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
 
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
@@ -674,6 +718,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             hidden_states=language_model_output.hidden_states,
             attentions=language_model_output.attentions,
             projector_features=projected_patch_embeddings,
+            static_features=(static, other_static) if other_pixel_values is not None else None,
         )
 
     # === GenerationMixin Methods ===
