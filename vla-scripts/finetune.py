@@ -464,7 +464,7 @@ def run_forward_pass(
             pair_logits.diagonal().copy_(positive_logits)
             nce_loss = F.cross_entropy(pair_logits, torch.arange(len(query), device=query.device))
             metrics['nce_loss'] = nce_loss.item()
-            loss = loss + 0.01 * nce_loss
+            loss = loss + 0.000 * nce_loss
             
         if 'commit_loss' in static:
             raise

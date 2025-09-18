@@ -1,4 +1,5 @@
 torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
+  --disentangle False \
   --vla_path openvla/openvla-7b \
   --data_root_dir dataset/ \
   --dataset_name libero_10_no_noops \
