@@ -71,6 +71,7 @@ def vector_normalize(*xs):
 
 @dataclass
 class FinetuneConfig:
+    seed: int = 42
     disentangle: bool = False
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
@@ -788,6 +789,22 @@ def run_validation(
     if distributed_state.is_main_process:
         log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
 
+def seed_everything(seed: int) -> None:
+    """
+    Set random seed for reproducibility.
+
+    Args:
+        seed (int): Random seed.
+
+    Returns:
+        None.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
@@ -809,6 +826,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
+
+    seed_everything(cfg.seed)
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
