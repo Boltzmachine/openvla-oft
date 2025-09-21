@@ -2,31 +2,47 @@ import torch
 from torch import nn
 from vit_pytorch.vit import Attention, FeedForward, Transformer2
 from vector_quantize_pytorch import VectorQuantize, FSQ
+from einops import rearrange
 
 
 class QueryTransformer(nn.Module):
-    def __init__(
-        self,
-        n_query,
-        dim,
-    ):
+    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
         super().__init__()
-        self.n_query = n_query
-        self.query = nn.Parameter(torch.randn(1, n_query, dim))
-        self.transformer = Transformer2(
-            dim,
-            depth=1,
-            dim_head=dim // 8,
-            heads=8,
-            mlp_dim=dim,
-            dropout=0.1,
-        )
-        
-    def forward(self, x):
-        query = self.query.expand(x.shape[0], -1, -1)  # (B, n_query, dim)
-        x = torch.cat([query, x], dim=1)  # (B, n_query + N, dim)
-        x = self.transformer(x)  # (B, n_query + N, dim)
-        return x[:, :self.n_query, :]  # (B, n_query, dim)
+        inner_dim = dim_head *  heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.norm = nn.LayerNorm(dim)
+
+        self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
+
+        self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
+        self.q = nn.Parameter(torch.randn(1, 256, dim))
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
+
+    def forward(self, x, additional_q):
+        q = self.q + additional_q
+        x = self.norm(x)
+
+        kv = self.to_kv(x).chunk(2, dim = -1)
+        qkv = tuple([q, *kv])
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
+
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
           
 
 class AttentionPooling(nn.Module):
@@ -54,33 +70,17 @@ class DisentangleAdapter(nn.Module):
         
         self.pos_embedding = nn.Parameter(torch.randn(1, n_token + 1, hidden_dim))
         self.type_embedding = nn.Embedding(2, hidden_dim)
+        self.backbone = backbone
         if backbone == "transformer":
             self.common_layers = Transformer2(hidden_dim, depth=1, dim_head=hidden_dim // 8, heads=8, mlp_dim=hidden_dim, dropout=0.1)
-
-            self.static_layers = nn.Sequential(
-            Transformer2(hidden_dim, depth=1, dim_head=hidden_dim // 8, heads=8, mlp_dim=hidden_dim, dropout=0.1),
-            nn.Linear(hidden_dim, hidden_dim//2),
-            )
-            self.dynamic_layers = nn.Sequential(
-            Transformer2(hidden_dim, depth=1, dim_head=hidden_dim // 8, heads=8, mlp_dim=hidden_dim, dropout=0.1),
-            nn.Linear(hidden_dim, hidden_dim//2),
-            )
         elif backbone == "mlp":
             self.common_layers = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, hidden_dim),
-            )   
-            self.static_layers = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim // 2, hidden_dim // 2),
             )
-            self.dynamic_layers = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim // 2, hidden_dim // 2),
-            )
+        elif backbone == "query_transformer":
+            self.common_layers = QueryTransformer(hidden_dim, heads=8, dim_head=hidden_dim // 8, dropout=0.1)
         else:
             raise
         
@@ -128,8 +128,12 @@ class DisentangleAdapter(nn.Module):
     def forward(self, features):
         type_id = torch.tensor([0] * self.static_dim + [1] * self.dynamic_dim, device=features.device).unsqueeze(0)  # (1, C)
         type_embedding = self.type_embedding(type_id)  # (1, C, D)
-        features = features + type_embedding  # (B, C, D)
-        features = self.common_layers(features)
+        if self.backbone == "query_transformer":
+            type_embedding = type_embedding.expand(features.shape[0], -1, -1)  # (B, C, D)
+            features = self.common_layers(features, type_embedding)
+        else:
+            # features = features + type_embedding  # (B, C, D)
+            features = self.common_layers(features)
         static_features = features[:, :self.static_dim]
         dynamic_features = features[:, self.static_dim:]
         

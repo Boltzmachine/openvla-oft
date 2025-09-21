@@ -25,9 +25,15 @@ def chunk_act_obs(traj: Dict, window_size: int, backward_observation_window_size
     traj_len = tf.shape(traj["action"])[0]
     action_dim = traj["action"].shape[-1]
     effective_traj_len = traj_len - future_action_window_size
-    chunk_indices = tf.broadcast_to(tf.range(-backward_observation_window_size + 1, 1), [effective_traj_len, backward_observation_window_size]) + tf.broadcast_to(
-        tf.range(effective_traj_len)[:, None], [effective_traj_len, backward_observation_window_size]
-    )
+
+    if backward_observation_window_size > 0:
+        chunk_indices = tf.broadcast_to(tf.concat([[-backward_observation_window_size], tf.range(-window_size + 1, 1)], axis=0), [effective_traj_len, window_size+1]) + tf.broadcast_to(
+            tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size+1]
+        )
+    else:    
+        chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [effective_traj_len, window_size]) + tf.broadcast_to(
+            tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size]
+        )
 
     action_chunk_indices = tf.broadcast_to(
         tf.range(-window_size + 1, 1 + future_action_window_size),

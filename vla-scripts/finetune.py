@@ -448,6 +448,9 @@ def run_forward_pass(
         if 'indices' in static:
             static_acc = (static['indices'] == other_static['indices']).float().mean(1)
             metrics['static_acc'] = static_acc.mean().item()
+        else:
+            static_mae = (torch.abs(static['features'] - other_static['features'])).mean()
+            metrics['static_mae'] = static_mae.item()
 
         if "dists" in static:
             raise
@@ -464,7 +467,7 @@ def run_forward_pass(
             pair_logits.diagonal().copy_(positive_logits)
             nce_loss = F.cross_entropy(pair_logits, torch.arange(len(query), device=query.device))
             metrics['nce_loss'] = nce_loss.item()
-            loss = loss + 0.000 * nce_loss
+            loss = loss + 0.01 * nce_loss
             
         if 'commit_loss' in static:
             raise
@@ -875,16 +878,15 @@ def finetune(cfg: FinetuneConfig) -> None:
         trust_remote_code=True,
     ).to(device_id)
 
-    modules_to_save = []
-    if cfg.disentangle:
-        vla.patch_projector()
-        modules_to_save += ["action_predictor", "disentangle_adapter", "attn_pooler"]
-
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
     # LoRA setup
     if cfg.use_lora:
+        modules_to_save = []
+        if cfg.disentangle:
+            modules_to_save += ["action_predictor", "disentangle_adapter", "attn_pooler"]
+
         lora_config = LoraConfig(
             r=cfg.lora_rank,
             lora_alpha=min(cfg.lora_rank, 16),
@@ -893,7 +895,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             init_lora_weights="gaussian",
             modules_to_save=modules_to_save,
         )
-        # lora_config = _maybe_include_all_linear_layers(lora_config, vla)
+        lora_config = _maybe_include_all_linear_layers(lora_config, vla)
+        
+        if cfg.disentangle:
+            vla.patch_projector()
+            
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
@@ -914,6 +920,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
 
+    # if distributed_state.is_main_process:
+    #     wandb.watch(vla, log="all", log_freq=100)
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
 
@@ -1071,8 +1079,6 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
-    # wandb.watch(vla, log="all", log_freq=100)
-
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
@@ -1102,6 +1108,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Backward pass
             normalized_loss.backward()
+            torch.nn.utils.clip_grad_norm_(vla.parameters(), 0.8)
 
             # Store recent train metrics
             for metric_name, value in metrics.items():

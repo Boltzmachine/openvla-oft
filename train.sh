@@ -1,5 +1,5 @@
-torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
-  --disentangle False \
+torchrun --standalone --nnodes 1 --nproc-per-node 4 vla-scripts/finetune.py \
+  --disentangle True \
   --vla_path openvla/openvla-7b \
   --data_root_dir dataset/ \
   --dataset_name libero_10_no_noops \
@@ -10,6 +10,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
   --num_images_in_input 1 \
   --use_proprio False \
   --batch_size 4 \
+  --grad_accumulation_steps 4 \
   --learning_rate 5e-4 \
   --num_steps_before_decay 100000 \
   --max_steps 150005 \

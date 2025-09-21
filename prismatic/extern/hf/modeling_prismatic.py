@@ -371,9 +371,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return self.disentangle_adapter.static_dim
         return None
                 
-    def patch_projector(self):
-        self.disentangle_adapter = DisentangleAdapter(hidden_dim=4096).to(self.language_model.device)
+    def patch_projector(self, backbone="query_transformer", quantizer='none'):
+        self.disentangle_adapter = DisentangleAdapter(hidden_dim=4096, backbone=backbone, quantizer=quantizer).to(self.language_model.device)
         self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
+        self.config.use_disentangle_adapter = True
 
         return self
     
@@ -718,7 +719,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             hidden_states=language_model_output.hidden_states,
             attentions=language_model_output.attentions,
             projector_features=projected_patch_embeddings,
-            static_features=(static, other_static) if "static" in locals() else None,
+            static_features=(static, other_static) if "static" in locals() and "other_static" in locals() else None,
         )
 
     # === GenerationMixin Methods ===
