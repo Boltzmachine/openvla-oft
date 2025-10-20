@@ -75,6 +75,7 @@ def vector_normalize(*xs):
 class FinetuneConfig:
     seed: int = 42
     disentangle: bool = False
+    with_memory: bool = False
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
@@ -696,7 +697,7 @@ def save_training_checkpoint(
         base_vla = AutoModelForVision2Seq.from_pretrained(
             cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
         )
-        if cfg.disentangle:
+        if cfg.disentangle and not hasattr(base_vla, "disentangle_adapter"):
             base_vla.patch_projector()
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
@@ -914,13 +915,13 @@ def finetune(cfg: FinetuneConfig) -> None:
             r=cfg.lora_rank,
             lora_alpha=min(cfg.lora_rank, 16),
             lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
+            target_modules={'fc1', 'k_proj', 'lm_head', 'v_proj', 'fc3', 'o_proj', 'q', 'down_proj', 'fc2', 'gate_proj', 'up_proj', 'qkv', 'proj', 'q_proj', 'kv'},
             init_lora_weights="gaussian",
             modules_to_save=modules_to_save,
         )
-        lora_config = _maybe_include_all_linear_layers(lora_config, vla)
+        # lora_config = _maybe_include_all_linear_layers(lora_config, vla)
         
-        if cfg.disentangle:
+        if cfg.disentangle and not hasattr(vla, "disentangle_adapter"):
             vla.patch_projector()
             
         vla = get_peft_model(vla, lora_config)
@@ -989,7 +990,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
 
     # Get number of vision patches
-    NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
+    NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * (vla.module.vision_backbone.get_num_images_in_input() + cfg.with_memory)
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
@@ -1056,6 +1057,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        disentangle=cfg.disentangle,
+        with_memory=cfg.with_memory,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -1066,6 +1069,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
             train=False,
+            disentangle=cfg.disentangle,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference

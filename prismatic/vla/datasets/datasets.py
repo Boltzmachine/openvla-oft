@@ -41,6 +41,8 @@ class RLDSBatchTransform:
         if len(rlds_batch["observation"]["image_primary"]) > 1:
             selected_index = random.randint(0, len(rlds_batch["observation"]["image_primary"]) - 2)
             other_img = Image.fromarray(rlds_batch["observation"]["image_primary"][selected_index])
+        else:
+            other_img = None
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
         actions = rlds_batch["action"]
 
@@ -73,6 +75,8 @@ class RLDSBatchTransform:
         pixel_values = self.image_transform(img)
         if other_img is not None:
             other_pixel_values = self.image_transform(other_img)
+        else:
+            other_pixel_values = None
 
         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
         labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
@@ -83,7 +87,6 @@ class RLDSBatchTransform:
 
         # Add additional inputs
         if self.use_wrist_image:
-            raise
             all_wrist_pixels = []
             for k in rlds_batch["observation"].keys():
                 if "wrist" in k:
@@ -108,9 +111,13 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        disentangle: bool = False,
+        with_memory: bool = False,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
+        self.disentangle = disentangle
+        self.with_memory = with_memory
 
         # Configure RLDS Dataset(s)
         if self.data_mix in OXE_NAMED_MIXTURES:
@@ -134,10 +141,17 @@ class RLDSDataset(IterableDataset):
             load_language=True,
             action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,
         )
+        if self.with_memory:
+            backward_observation_window_size = 100000000
+        elif self.disentangle:
+            assert not self.with_memory
+            backward_observation_window_size = 10
+        else:
+            backward_observation_window_size = 0
         rlds_config = dict(
             traj_transform_kwargs=dict(
                 window_size=1,                                      # If we wanted to feed / predict more than one step
-                backward_observation_window_size=10,
+                backward_observation_window_size=backward_observation_window_size,
                 future_action_window_size=NUM_ACTIONS_CHUNK-1,      # For action chunking
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused
