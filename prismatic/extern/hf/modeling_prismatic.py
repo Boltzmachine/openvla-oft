@@ -64,6 +64,60 @@ def ls_apply_patch(ls_module: LayerScale):
     ls_module.forward = _ls_new_forward.__get__(ls_module, LayerScale)
     del ls_module.gamma
 
+from typing import Sequence
+
+def _intermediate_layers(
+        self,
+        x: torch.Tensor,
+        n: Union[int, Sequence] = 1,
+        **kwargs
+):
+    outputs, num_blocks = [], len(self.blocks)
+    take_indices = set(range(num_blocks - n, num_blocks) if isinstance(n, int) else n)
+
+    # forward pass
+    x = self.patch_embed(x)
+    x = self._pos_embed(x)
+    x = self.patch_drop(x)
+    x = self.norm_pre(x)
+    for i, blk in enumerate(self.blocks):
+        if 'n_inject' in kwargs and kwargs['n_inject'] == i:
+            x[:, self.num_prefix_tokens:] += kwargs['injected_embeddings']
+        x = blk(x)
+        if i in take_indices:
+            outputs.append(x)
+
+    return outputs
+
+def get_intermediate_layers(
+        self,
+        x: torch.Tensor,
+        n: Union[int, Sequence] = 1,
+        reshape: bool = False,
+        return_prefix_tokens: bool = False,
+        norm: bool = False,
+        **kwargs,
+) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
+    """ Intermediate layer accessor (NOTE: This is a WIP experiment).
+    Inspired by DINO / DINOv2 interface
+    """
+    # take last n blocks if n is an int, if in is a sequence, select by matching indices
+    outputs = _intermediate_layers(self, x, n, **kwargs)
+    if norm:
+        outputs = [self.norm(out) for out in outputs]
+    prefix_tokens = [out[:, 0:self.num_prefix_tokens] for out in outputs]
+    outputs = [out[:, self.num_prefix_tokens:] for out in outputs]
+
+    if reshape:
+        grid_size = self.patch_embed.grid_size
+        outputs = [
+            out.reshape(x.shape[0], grid_size[0], grid_size[1], -1).permute(0, 3, 1, 2).contiguous()
+            for out in outputs
+        ]
+
+    if return_prefix_tokens:
+        return tuple(zip(outputs, prefix_tokens))
+    return tuple(outputs)
 
 # === Prismatic Vision Backbone (nn.Module) Definitions (w/ Fused Backbone Support) ===
 class PrismaticVisionBackbone(nn.Module):
@@ -136,7 +190,7 @@ class PrismaticVisionBackbone(nn.Module):
 
         # Monkey-patch the forward function to extract the second-to-last layer features
         num_blocks = len(featurizer.blocks)
-        featurizer.forward = unpack_tuple(partial(featurizer.get_intermediate_layers, n={num_blocks - 2}))
+        featurizer.forward = unpack_tuple(partial(get_intermediate_layers.__get__(featurizer), n={num_blocks - 2}))
 
         return featurizer
 
@@ -185,7 +239,7 @@ class PrismaticVisionBackbone(nn.Module):
         """
         self.num_images_in_input = num_images_in_input
 
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Implements the forward pass for the vision backbone.
 
@@ -197,15 +251,19 @@ class PrismaticVisionBackbone(nn.Module):
         """
         if self.num_images_in_input == 1:
             if not self.use_fused_vision_backbone:
-                return self.featurizer(pixel_values)
+                return self.featurizer(pixel_values, **kwargs)
 
             # Split `pixel_values :: [bsz, 2 * 3, resolution, resolution]` =>> featurize =>> channel stack
             img, img_fused = torch.split(pixel_values, [3, 3], dim=1)
-            patches, patches_fused = self.featurizer(img), self.fused_featurizer(img_fused)
+            if 'n_inject' in kwargs:
+                patches, patches_fused = self.featurizer(img, n_inject=kwargs['n_inject'], injected_embeddings=kwargs['injected_embeddings'][0]), self.fused_featurizer(img_fused, n_inject=kwargs['n_inject'], injected_embeddings=kwargs['injected_embeddings'][1])
+            else:
+                patches, patches_fused = self.featurizer(img), self.fused_featurizer(img_fused)
 
             return torch.cat([patches, patches_fused], dim=2)
 
         else:
+            raise
             assert self.use_fused_vision_backbone, "Multi-image inputs require using fused backbone!"
 
             # Split `pixel_values` into individual images (each with 6 channels: 3 for SigLIP + 3 for DINOv2)
@@ -359,7 +417,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.pad_token_id = config.pad_token_id
         self.llm_dim = config.text_config.hidden_size
 
-        if getattr(config, "use_disentangle_adapter", False):
+        if getattr(config, "disentangle_method", "none") != "none":
             self.patch_projector()
 
         # HF Boilerplate =>> initializes weights via `_init_weights()` and sets gradient checkpointing
@@ -371,11 +429,20 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return self.disentangle_adapter.static_dim
         return None
                 
-    def patch_projector(self, backbone="query_transformer", quantizer='none'):
-        self.disentangle_adapter = DisentangleAdapter(hidden_dim=4096, backbone=backbone, quantizer=quantizer).to(self.language_model.device)
+    def patch_projector(self):
+        if self.config.disentangle_method == "extra":
+            self.config.backbone = "query_transformer"
+            self.config.quantizer = "none"
+            hidden_dim = 4096
+        elif self.config.disentangle_method == "inject":
+            self.config.backbone = "none"
+            self.config.quantizer = "none"
+            hidden_dim = 1024
+        else:
+            raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
+        self.disentangle_adapter = DisentangleAdapter(hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer).to(self.language_model.device)
         self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
-        self.config.use_disentangle_adapter = True
-
+        
         return self
     
     # === `PreTrainedModel` Boilerplate ===
@@ -456,18 +523,25 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
     def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False):
         """Process vision features with optional FiLM conditioning"""
+        if self.config.disentangle_method == "inject":
+            kwargs = { 'n_inject': 12, 'injected_embeddings': self.disentangle_adapter(None, device=pixel_values.device) }
         if use_film:
             # FiLM: Infuse language inputs into visual features
-            patch_features = self.vision_backbone(pixel_values, language_embeddings)  # (bsz, 256 * num_images, D)
+            patch_features = self.vision_backbone(pixel_values, language_embeddings, **kwargs)  # (bsz, 256 * num_images, D)
         else:
-            patch_features = self.vision_backbone(pixel_values)  # (bsz, 256 * num_images, D)
-
+            patch_features = self.vision_backbone(pixel_values, **kwargs)  # (bsz, 256 * num_images, D)
         # Project patch embeddings into language embedding space
         patch_features = self.projector(patch_features)
 
-        if hasattr(self, 'disentangle_adapter'):
+        if self.config.disentangle_method == "extra":
             static_features, dynamic_features = self.disentangle_adapter(patch_features)
             return static_features, dynamic_features
+        elif self.config.disentangle_method == "inject":
+            try:
+                static_dim = self.disentangle_adapter.original_module.static_dim
+            except:
+                static_dim = self.disentangle_adapter.static_dim
+            return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
         else:
             return patch_features
 
@@ -608,7 +682,6 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 input_embeddings.shape[0], -1, input_embeddings.shape[2]
             )  # (B, lang_seq_len, llm_dim)
 
-            other_pixel_values = None
             if other_pixel_values is not None:
                 assert not use_film
                 # selected_future_index = torch.randint(0, other_pixel_values.size(1), (1,)).item()
@@ -620,9 +693,6 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
             if isinstance(projected_patch_embeddings, tuple):
                 static, dynamic = projected_patch_embeddings
-                if hasattr(self, "attn_pooler") and other_pixel_values is not None:
-                    static['pooling'] = self.attn_pooler(static['features'])
-                    other_static['pooling'] = self.attn_pooler(other_static['features'])
                 if other_pixel_values is not None:
                     if random.random() < 0.5:
                         projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)

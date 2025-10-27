@@ -70,6 +70,7 @@ class DisentangleAdapter(nn.Module):
         
         self.pos_embedding = nn.Parameter(torch.randn(1, n_token + 1, hidden_dim))
         self.type_embedding = nn.Embedding(2, hidden_dim)
+        self.type_embedding2 = nn.Embedding(2, 1152)
         self.backbone = backbone
         if backbone == "transformer":
             self.common_layers = Transformer2(hidden_dim, depth=1, dim_head=hidden_dim // 8, heads=8, mlp_dim=hidden_dim, dropout=0.1)
@@ -81,6 +82,8 @@ class DisentangleAdapter(nn.Module):
             )
         elif backbone == "query_transformer":
             self.common_layers = QueryTransformer(hidden_dim, heads=8, dim_head=hidden_dim // 8, dropout=0.1)
+        elif backbone == "none":
+            self.common_layers = nn.Identity()
         else:
             raise
         
@@ -124,10 +127,18 @@ class DisentangleAdapter(nn.Module):
             )
         else:
             self.post_vq = nn.Identity()
+            
+    def get_type_embedding(self, embedding_layer, device):
+        type_id = torch.tensor([0] * self.static_dim + [1] * self.dynamic_dim, device=device).unsqueeze(0)  # (1, C)
+        type_embedding = embedding_layer(type_id)  # (1, C, D) 
+        return type_embedding
 
-    def forward(self, features):
-        type_id = torch.tensor([0] * self.static_dim + [1] * self.dynamic_dim, device=features.device).unsqueeze(0)  # (1, C)
-        type_embedding = self.type_embedding(type_id)  # (1, C, D)
+    def forward(self, features, device=None):
+        if features is None:
+            type_embedding = self.get_type_embedding(self.type_embedding, device)
+            type_embedding2 = self.get_type_embedding(self.type_embedding2, device)
+            return type_embedding, type_embedding2
+        type_embedding = self.get_type_embeddings(features.device)
         if self.backbone == "query_transformer":
             type_embedding = type_embedding.expand(features.shape[0], -1, -1)  # (B, C, D)
             features = self.common_layers(features, type_embedding)

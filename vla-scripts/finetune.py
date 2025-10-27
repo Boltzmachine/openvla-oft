@@ -74,7 +74,7 @@ def vector_normalize(*xs):
 @dataclass
 class FinetuneConfig:
     seed: int = 42
-    disentangle: bool = False
+    disentangle: str = "extra"
     with_memory: bool = False
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
@@ -697,7 +697,8 @@ def save_training_checkpoint(
         base_vla = AutoModelForVision2Seq.from_pretrained(
             cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
         )
-        if cfg.disentangle and not hasattr(base_vla, "disentangle_adapter"):
+        if cfg.disentangle != "none" and not hasattr(base_vla, "disentangle_adapter"):
+            base_vla.config.disentangle_method = cfg.disentangle
             base_vla.patch_projector()
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
@@ -921,7 +922,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         # lora_config = _maybe_include_all_linear_layers(lora_config, vla)
         
-        if cfg.disentangle and not hasattr(vla, "disentangle_adapter"):
+        if cfg.disentangle != "none" and not hasattr(vla, "disentangle_adapter"):
+            vla.config.disentangle_method = cfg.disentangle
             vla.patch_projector()
             
         vla = get_peft_model(vla, lora_config)
