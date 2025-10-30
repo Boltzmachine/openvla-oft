@@ -312,49 +312,48 @@ def run_episode(
 
     # Run episode
     success = False
-    try:
-        while t < max_steps + cfg.num_steps_wait:
-            # Do nothing for the first few timesteps to let objects stabilize
-            if t < cfg.num_steps_wait:
-                obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
-                t += 1
-                continue
-
-            # Prepare observation
-            observation, img = prepare_observation(obs, resize_size)
-            replay_images.append(img)
-
-            # If action queue is empty, requery model
-            if len(action_queue) == 0:
-                # Query model to get action
-                actions = get_action(
-                    cfg,
-                    model,
-                    observation,
-                    task_description,
-                    processor=processor,
-                    action_head=action_head,
-                    proprio_projector=proprio_projector,
-                    noisy_action_projector=noisy_action_projector,
-                    use_film=cfg.use_film,
-                )
-                action_queue.extend(actions)
-
-            # Get action from queue
-            action = action_queue.popleft()
-
-            # Process action
-            action = process_action(action, cfg.model_family)
-
-            # Execute action in environment
-            obs, reward, done, info = env.step(action.tolist())
-            if done:
-                success = True
-                break
+    while t < max_steps + cfg.num_steps_wait:
+        # Do nothing for the first few timesteps to let objects stabilize
+        if t < cfg.num_steps_wait:
+            obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
             t += 1
+            continue
 
-    except Exception as e:
-        log_message(f"Episode error: {e}", log_file)
+        # Prepare observation
+        observation, img = prepare_observation(obs, resize_size)
+        replay_images.append(img)
+
+        # If action queue is empty, requery model
+        if len(action_queue) == 0:
+            # Query model to get action
+            actions = get_action(
+                cfg,
+                model,
+                observation,
+                task_description,
+                processor=processor,
+                action_head=action_head,
+                proprio_projector=proprio_projector,
+                noisy_action_projector=noisy_action_projector,
+                use_film=cfg.use_film,
+            )
+            action_queue.extend(actions)
+
+        # Get action from queue
+        action = action_queue.popleft()
+
+        # Process action
+        action = process_action(action, cfg.model_family)
+
+        # Execute action in environment
+        obs, reward, done, info = env.step(action.tolist())
+        if done:
+            success = True
+            break
+        t += 1
+
+    # except Exception as e:
+    #     log_message(f"Episode error: {e}", log_file)
 
     return success, replay_images
 

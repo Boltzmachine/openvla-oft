@@ -928,6 +928,10 @@ def finetune(cfg: FinetuneConfig) -> None:
             
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
+    else:
+        vla.config.disentangle_method = cfg.disentangle
+        vla.patch_projector()
+        
 
     # FiLM setup
     if cfg.use_film:
@@ -1017,7 +1021,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Create learning rate scheduler
     scheduler = MultiStepLR(
         optimizer,
-        milestones=[cfg.num_steps_before_decay],  # Number of steps after which LR will change
+        milestones=[cfg.num_steps_before_decay - cfg.resume_step],  # Number of steps after which LR will change
         gamma=0.1,  # Multiplicative factor of learning rate decay
     )
 

@@ -138,7 +138,7 @@ class DisentangleAdapter(nn.Module):
             type_embedding = self.get_type_embedding(self.type_embedding, device)
             type_embedding2 = self.get_type_embedding(self.type_embedding2, device)
             return type_embedding, type_embedding2
-        type_embedding = self.get_type_embeddings(features.device)
+        type_embedding = self.get_type_embedding(self.type_embedding, features.device)
         if self.backbone == "query_transformer":
             type_embedding = type_embedding.expand(features.shape[0], -1, -1)  # (B, C, D)
             features = self.common_layers(features, type_embedding)
