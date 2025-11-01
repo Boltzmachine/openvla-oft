@@ -89,6 +89,7 @@ class DisentangleAdapter(nn.Module):
         
         static_dim = int(n_token * static_ratio)  # static dim
         dynamic_dim = n_token - static_dim  # dynamic dim
+        self.register_buffer("static_ratio", torch.tensor(static_ratio, dtype=torch.float32))
         self.register_buffer("static_dim", torch.tensor(static_dim, dtype=torch.int64))
         self.register_buffer("dynamic_dim", torch.tensor(dynamic_dim, dtype=torch.int64))
         

@@ -263,7 +263,7 @@ class PrismaticVisionBackbone(nn.Module):
             return torch.cat([patches, patches_fused], dim=2)
 
         else:
-            raise
+            assert len(kwargs) == 0
             assert self.use_fused_vision_backbone, "Multi-image inputs require using fused backbone!"
 
             # Split `pixel_values` into individual images (each with 6 channels: 3 for SigLIP + 3 for DINOv2)
@@ -431,7 +431,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return self.disentangle_adapter.static_dim
         return None
                 
-    def patch_projector(self):
+    def patch_projector(self, static_ratio):
         if self.config.disentangle_method == "extra":
             self.config.backbone = "query_transformer"
             self.config.quantizer = "none"
@@ -442,7 +442,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             hidden_dim = 1024
         else:
             raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
-        self.disentangle_adapter = DisentangleAdapter(hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer).to(self.language_model.device)
+        self.disentangle_adapter = DisentangleAdapter(hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer, static_ratio=static_ratio).to(self.language_model.device)
         self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
         
         return self
@@ -536,9 +536,11 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             patch_features = self.vision_backbone(pixel_values, **kwargs)  # (bsz, 256 * num_images, D)
         # Project patch embeddings into language embedding space
         patch_features = self.projector(patch_features)
-
         if self.config.disentangle_method == "extra":
+            patch_features = patch_features.view(patch_features.shape[0] * self.vision_backbone.num_images_in_input, 256, patch_features.shape[-1])
             static_features, dynamic_features = self.disentangle_adapter(patch_features)
+            dynamic_features = dynamic_features.reshape(pixel_values.size(0), -1, dynamic_features.shape[-1]).contiguous()
+            static_features['features'] = static_features['features'].reshape(pixel_values.size(0), -1, static_features['features'].shape[-1]).contiguous()
             return static_features, dynamic_features
         elif self.config.disentangle_method == "inject":
             try:
@@ -698,6 +700,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
             if isinstance(projected_patch_embeddings, tuple):
                 static, dynamic = projected_patch_embeddings
+                if self.vision_backbone.num_images_in_input > 2:
+                    static['features'] = static['features'].view(pixel_values.size(0), self.vision_backbone.num_images_in_input, -1, static['features'].shape[-1]).mean(dim=1)
+                    projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+                    assert other_pixel_values is None
                 if other_pixel_values is not None:
                     if random.random() < 0.5:
                         projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
@@ -705,7 +711,6 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                         projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
                 else:
                     projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
-                    
             # projected_patch_embeddings = torch.cat([other_image_features, projected_patch_embeddings], dim=1) if other_pixel_values is not None else projected_patch_embeddings # for memory
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(

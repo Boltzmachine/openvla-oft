@@ -6,12 +6,12 @@ that represents a single trajectory, meaning each tensor has the same leading di
 """
 
 import logging
-from typing import Dict
+from typing import Dict, Union
 
 import tensorflow as tf
 
 
-def chunk_act_obs(traj: Dict, window_size: int, backward_observation_window_size: int, future_action_window_size: int = 0) -> Dict:
+def chunk_act_obs(traj: Dict, window_size: int, backward_observation_window_size: Union[list, int], future_action_window_size: int = 0) -> Dict:
     """
     Chunks actions and observations into the given window_size.
 
@@ -26,14 +26,20 @@ def chunk_act_obs(traj: Dict, window_size: int, backward_observation_window_size
     action_dim = traj["action"].shape[-1]
     effective_traj_len = traj_len - future_action_window_size
 
-    if backward_observation_window_size > 0:
-        chunk_indices = tf.broadcast_to(tf.concat([[-backward_observation_window_size], tf.range(-window_size + 1, 1)], axis=0), [effective_traj_len, window_size+1]) + tf.broadcast_to(
-            tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size+1]
-        )
-    else:    
-        chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [effective_traj_len, window_size]) + tf.broadcast_to(
-            tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size]
-        )
+    if isinstance(backward_observation_window_size, list):
+        backward_length = len(backward_observation_window_size)
+        chunk_indices = tf.broadcast_to(tf.constant(backward_observation_window_size, dtype=tf.int32), [effective_traj_len, backward_length]) + tf.broadcast_to(
+                tf.range(effective_traj_len)[:, None], [effective_traj_len, backward_length]
+            )
+    elif isinstance(backward_observation_window_size, int):
+        if backward_observation_window_size > 0:
+            chunk_indices = tf.broadcast_to(tf.concat([[-backward_observation_window_size], tf.range(-window_size + 1, 1)], axis=0), [effective_traj_len, window_size+1]) + tf.broadcast_to(
+                tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size+1]
+            )
+        else:    
+            chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [effective_traj_len, window_size]) + tf.broadcast_to(
+                tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size]
+            )
 
     action_chunk_indices = tf.broadcast_to(
         tf.range(-window_size + 1, 1 + future_action_window_size),

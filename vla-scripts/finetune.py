@@ -75,7 +75,8 @@ def vector_normalize(*xs):
 class FinetuneConfig:
     seed: int = 42
     disentangle: str = "extra"
-    with_memory: bool = False
+    static_ratio: float = 0.5
+    with_memory: Optional[list] = None
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
@@ -699,7 +700,7 @@ def save_training_checkpoint(
         )
         if cfg.disentangle != "none" and not hasattr(base_vla, "disentangle_adapter"):
             base_vla.config.disentangle_method = cfg.disentangle
-            base_vla.patch_projector()
+            base_vla.patch_projector(vla.module.disentangle_adapter.original_module.static_ratio)
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
 
@@ -828,6 +829,9 @@ def finetune(cfg: FinetuneConfig) -> None:
     Returns:
         None.
     """
+    if cfg.with_memory is not None:
+        cfg.num_images_in_input = cfg.with_memory[1] + 1
+    
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
@@ -924,14 +928,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         
         if cfg.disentangle != "none" and not hasattr(vla, "disentangle_adapter"):
             vla.config.disentangle_method = cfg.disentangle
-            vla.patch_projector()
+            vla.patch_projector(cfg.static_ratio)
             
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
     else:
+        raise
         vla.config.disentangle_method = cfg.disentangle
         vla.patch_projector()
-        
 
     # FiLM setup
     if cfg.use_film:
@@ -994,9 +998,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         noisy_action_projector = init_module(
             NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
         )
-
-    # Get number of vision patches
-    NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * (vla.module.vision_backbone.get_num_images_in_input() + cfg.with_memory)
+    
+    if cfg.with_memory is not None:
+        assert cfg.disentangle != "none"
+        num_static_patches = vla.module.disentangle_adapter.original_module.static_dim.item()
+        num_dynamic_patches = vla.module.vision_backbone.get_num_patches() - num_static_patches
+        NUM_PATCHES = num_dynamic_patches * vla.module.vision_backbone.get_num_images_in_input() + num_static_patches
+    else:
+        NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
@@ -1021,7 +1030,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Create learning rate scheduler
     scheduler = MultiStepLR(
         optimizer,
-        milestones=[cfg.num_steps_before_decay - cfg.resume_step],  # Number of steps after which LR will change
+        milestones=[cfg.num_steps_before_decay - cfg.resume_step if cfg.resume_step is not None else cfg.num_steps_before_decay],  # Number of steps after which LR will change
         gamma=0.1,  # Multiplicative factor of learning rate decay
     )
 
@@ -1045,7 +1054,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # ---
 
     # We assume that the model takes as input one third-person camera image and 1 or 2 optional wrist camera image(s)
-    use_wrist_image = cfg.num_images_in_input > 1
+    use_wrist_image = False #cfg.num_images_in_input > 1
 
     # Create training and optional validation datasets
     batch_transform = RLDSBatchTransform(

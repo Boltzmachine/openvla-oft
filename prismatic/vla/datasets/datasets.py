@@ -7,7 +7,7 @@ format to OpenVLA, IterableDataset shim.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Type
+from typing import Any, Dict, Tuple, Type, Optional, Union
 
 import numpy as np
 import random
@@ -38,10 +38,13 @@ class RLDSBatchTransform:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
-        if len(rlds_batch["observation"]["image_primary"]) > 1:
+        if len(rlds_batch["observation"]["image_primary"]) == 2:
             selected_index = random.randint(0, len(rlds_batch["observation"]["image_primary"]) - 2)
             other_img = Image.fromarray(rlds_batch["observation"]["image_primary"][selected_index])
+        elif len(rlds_batch["observation"]["image_primary"]) == 1:
+            other_img = None
         else:
+            img = [Image.fromarray(img_array) for img_array in rlds_batch["observation"]["image_primary"]]
             other_img = None
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
         actions = rlds_batch["action"]
@@ -72,7 +75,10 @@ class RLDSBatchTransform:
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
-        pixel_values = self.image_transform(img)
+        if isinstance(img, list):
+            pixel_values = torch.cat([self.image_transform(im) for im in img])
+        else:
+            pixel_values = self.image_transform(img)
         if other_img is not None:
             other_pixel_values = self.image_transform(other_img)
         else:
@@ -112,7 +118,7 @@ class RLDSDataset(IterableDataset):
         train: bool = True,
         image_aug: bool = False,
         disentangle: bool = False,
-        with_memory: bool = False,
+        with_memory: Optional[tuple] = None,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -142,7 +148,10 @@ class RLDSDataset(IterableDataset):
             action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,
         )
         if self.with_memory:
-            backward_observation_window_size = 100000000
+            step_size, n_steps = self.with_memory[0], self.with_memory[1]
+            backward_observation_window_size = list(range(-step_size * n_steps, 1, step_size))
+            assert len(backward_observation_window_size) == n_steps + 1
+            assert backward_observation_window_size[-1] == 0
         elif self.disentangle:
             assert not self.with_memory
             backward_observation_window_size = 10
