@@ -13,6 +13,12 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import dlimp as dl
 import numpy as np
 import tensorflow as tf
+# tf.debugging.experimental.enable_dump_debug_info(
+#     dump_root="/tmp/tfdbg",
+#     tensor_debug_mode="FULL_HEALTH",
+#     circular_buffer_size=-1
+# )
+
 import tensorflow_datasets as tfds
 
 from prismatic.overwatch import initialize_overwatch

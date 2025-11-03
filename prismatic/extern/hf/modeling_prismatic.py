@@ -432,19 +432,21 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         return None
                 
     def patch_projector(self):
-        if self.config.disentangle_method == "extra":
-            self.config.backbone = "query_transformer"
-            self.config.quantizer = "none"
-            hidden_dim = 4096
-        elif self.config.disentangle_method == "inject":
-            self.config.backbone = "none"
-            self.config.quantizer = "none"
-            hidden_dim = 1024
-        else:
-            raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
-        self.disentangle_adapter = DisentangleAdapter(hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer).to(self.language_model.device)
-        self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
-        
+        if "none" not in self.config.disentangle_method:
+            if "extra" in self.config.disentangle_method:
+                self.config.backbone = "query_transformer"
+                self.config.quantizer = "none"
+                hidden_dim = 4096
+            elif 'inject' in self.config.disentangle_method:
+                self.config.backbone = "none"
+                self.config.quantizer = "none"
+                hidden_dim = 1024
+            else:
+                raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
+            self.disentangle_adapter = DisentangleAdapter(hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer).to(self.language_model.device)
+        if 'nce' in self.config.disentangle_method:
+            self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
+
         return self
     
     # === `PreTrainedModel` Boilerplate ===
@@ -523,7 +525,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         all_actions_mask = current_action_mask | next_actions_mask  # (B, seq_len)
         return all_actions_mask
 
-    def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False):
+    def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False, use_disentangle=False):
         """Process vision features with optional FiLM conditioning"""
         if self.config.disentangle_method == "inject":
             kwargs = { 'n_inject': 12, 'injected_embeddings': self.disentangle_adapter(None, device=pixel_values.device) }
@@ -545,6 +547,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 static_dim = self.disentangle_adapter.original_module.static_dim
             except:
                 static_dim = self.disentangle_adapter.static_dim
+            return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
+        elif use_disentangle:
+            static_dim = 128
             return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
         else:
             return patch_features
@@ -686,16 +691,16 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 input_embeddings.shape[0], -1, input_embeddings.shape[2]
             )  # (B, lang_seq_len, llm_dim)
 
-            other_pixel_values = None
+            # other_pixel_values = None
             if other_pixel_values is not None:
                 assert not use_film
                 # selected_future_index = torch.randint(0, other_pixel_values.size(1), (1,)).item()
-                other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film)
+                other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film, use_disentangle=True)
                 if isinstance(other_image_features, tuple):
                     other_static, other_dynamic = other_image_features
-
+            
             # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=other_pixel_values is not None)
             if isinstance(projected_patch_embeddings, tuple):
                 static, dynamic = projected_patch_embeddings
                 if other_pixel_values is not None:
@@ -705,6 +710,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                         projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
                 else:
                     projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+            
+            if hasattr(self, 'attn_pooler'):
+                static['pooling'] = self.attn_pooler(static['features'])
+                other_static['pooling'] = self.attn_pooler(other_static['features'])
                     
             # projected_patch_embeddings = torch.cat([other_image_features, projected_patch_embeddings], dim=1) if other_pixel_values is not None else projected_patch_embeddings # for memory
             # Add proprioceptive state if provided

@@ -471,7 +471,7 @@ def run_forward_pass(
             pair_logits.diagonal().copy_(positive_logits)
             nce_loss = F.cross_entropy(pair_logits, torch.arange(len(query), device=query.device))
             metrics['nce_loss'] = nce_loss.item()
-            #loss = loss + 0.01 * nce_loss
+            loss = loss + 0.1 * nce_loss
             
         if 'commit_loss' in static:
             raise
@@ -697,7 +697,7 @@ def save_training_checkpoint(
         base_vla = AutoModelForVision2Seq.from_pretrained(
             cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
         )
-        if cfg.disentangle != "none" and not hasattr(base_vla, "disentangle_adapter"):
+        if not hasattr(base_vla, "disentangle_adapter"):
             base_vla.config.disentangle_method = cfg.disentangle
             base_vla.patch_projector()
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
@@ -811,6 +811,7 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
+    
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
@@ -922,7 +923,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         # lora_config = _maybe_include_all_linear_layers(lora_config, vla)
         
-        if cfg.disentangle != "none" and not hasattr(vla, "disentangle_adapter"):
+        if not hasattr(vla, "disentangle_adapter"):
             vla.config.disentangle_method = cfg.disentangle
             vla.patch_projector()
             
@@ -1021,7 +1022,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Create learning rate scheduler
     scheduler = MultiStepLR(
         optimizer,
-        milestones=[cfg.num_steps_before_decay - cfg.resume_step],  # Number of steps after which LR will change
+        milestones=[cfg.num_steps_before_decay - cfg.resume_step] if cfg.resume_step is not None else [cfg.num_steps_before_decay],  # Number of steps after which LR will change
         gamma=0.1,  # Multiplicative factor of learning rate decay
     )
 
@@ -1063,7 +1064,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
-        disentangle=cfg.disentangle,
+        disentangle=True,
         with_memory=cfg.with_memory,
     )
     if cfg.use_val_set:
@@ -1075,7 +1076,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
             train=False,
-            disentangle=cfg.disentangle,
+            disentangle=True,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference

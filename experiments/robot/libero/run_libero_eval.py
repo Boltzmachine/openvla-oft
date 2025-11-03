@@ -4,6 +4,7 @@ run_libero_eval.py
 Evaluates a trained policy in a LIBERO simulation benchmark task suite.
 """
 
+from copy import deepcopy
 import json
 import logging
 import os
@@ -274,6 +275,14 @@ def process_action(action, model_family):
 
     return action
 
+def get_bounded_from_index(data, index):
+    if index <= 0:
+        if abs(index) > len(data):
+            index = 0
+    else:
+        raise NotImplementedError("Positive indexing not supported.")
+    return data[index]
+
 
 def run_episode(
     cfg: GenerateConfig,
@@ -308,6 +317,7 @@ def run_episode(
     # Setup
     t = 0
     replay_images = []
+    replay_observations = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
 
     # Run episode
@@ -322,6 +332,8 @@ def run_episode(
         # Prepare observation
         observation, img = prepare_observation(obs, resize_size)
         replay_images.append(img)
+        replay_observations.append(deepcopy(observation))
+        observation = {'full_image': get_bounded_from_index(replay_observations, -2)['full_image']}
 
         # If action queue is empty, requery model
         if len(action_queue) == 0:
