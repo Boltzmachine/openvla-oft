@@ -1000,10 +1000,12 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
     
     if cfg.with_memory is not None:
-        assert cfg.disentangle != "none"
-        num_static_patches = vla.module.disentangle_adapter.original_module.static_dim.item()
-        num_dynamic_patches = vla.module.vision_backbone.get_num_patches() - num_static_patches
-        NUM_PATCHES = num_dynamic_patches * vla.module.vision_backbone.get_num_images_in_input() + num_static_patches
+        if cfg.disentangle != "none":
+            num_static_patches = vla.module.disentangle_adapter.original_module.static_dim.item()
+            num_dynamic_patches = vla.module.vision_backbone.get_num_patches() - num_static_patches
+            NUM_PATCHES = num_dynamic_patches * vla.module.vision_backbone.get_num_images_in_input() + num_static_patches
+        else:
+            NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
     else:
         NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings

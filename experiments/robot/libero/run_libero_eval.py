@@ -18,6 +18,7 @@ import draccus
 import numpy as np
 import tqdm
 from libero.libero import benchmark
+from copy import deepcopy
 
 import wandb
 
@@ -57,6 +58,7 @@ class TaskSuite(str, Enum):
     LIBERO_GOAL = "libero_goal"
     LIBERO_10 = "libero_10"
     LIBERO_90 = "libero_90"
+    LIBERO_MEMORY = "libero_memory"
 
 
 # Define max steps for each task suite
@@ -66,6 +68,7 @@ TASK_MAX_STEPS = {
     TaskSuite.LIBERO_GOAL: 300,  # longest training demo has 270 steps
     TaskSuite.LIBERO_10: 520,  # longest training demo has 505 steps
     TaskSuite.LIBERO_90: 400,  # longest training demo has 373 steps
+    TaskSuite.LIBERO_MEMORY: 512,  # longest training demo has 512 steps
 }
 
 
@@ -290,13 +293,28 @@ def run_episode(
 ):
     """Run a single episode in the environment."""
     # Reset environment
-    env.reset()
+    if "memory" in cfg.task_suite_name:
+        retry = 0
+        while True:
+            try:
+                env.reset()
+                env.env.init_moving_params()
+                break
+            except Exception as e:
+                print(retry,e, file=open("log.txt", "a"))
+                retry += 1
+        env.env.moving_counter = -10
+        for _ in range(10):
+            obs, reward, done, info = env.step(get_libero_dummy_action("llava"))
+        assert env.env.moving_counter == 0, "Environment failed to settle after reset!"
+    else:
+        env.reset()
 
     # Set initial state if provided
     if initial_state is not None:
         obs = env.set_init_state(initial_state)
     else:
-        obs = env.get_observation()
+        obs = env.env._get_observations()
 
     # Initialize action queue
     if cfg.num_open_loop_steps != NUM_ACTIONS_CHUNK:
@@ -312,16 +330,39 @@ def run_episode(
 
     # Run episode
     success = False
-    while t < max_steps + cfg.num_steps_wait:
+    replay_observations = []
+    
+    def get_past_observations(replay_observations, indices):
+        past_obs = []
+        for idx in indices:
+            assert idx < 0
+            if idx < 0:
+                if -idx > len(replay_observations):
+                    past_obs.append(replay_observations[0]['full_image'])
+                else:
+                    past_obs.append(replay_observations[idx]['full_image'])
+        return past_obs
+    
+    def need_wait(task_name, env, t, num_steps_wait):
+        if "memory" in task_name:
+            return not env.env.moving_completed
+        else:
+            return t < num_steps_wait
+    
+    while t < max_steps:
         # Do nothing for the first few timesteps to let objects stabilize
-        if t < cfg.num_steps_wait:
+        if need_wait(cfg.task_suite_name, env, t, cfg.num_steps_wait):
             obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
-            t += 1
+            observation, img = prepare_observation(obs, resize_size)
+            replay_images.append(img)
+            replay_observations.append(deepcopy(observation))
             continue
 
         # Prepare observation
         observation, img = prepare_observation(obs, resize_size)
         replay_images.append(img)
+        replay_observations.append(deepcopy(observation))
+        observation = { 'full_image': get_past_observations(replay_observations, [-37, -25, -13, -1]) }
 
         # If action queue is empty, requery model
         if len(action_queue) == 0:
@@ -355,7 +396,7 @@ def run_episode(
     # except Exception as e:
     #     log_message(f"Episode error: {e}", log_file)
 
-    return success, replay_images
+    return success, replay_images, t
 
 
 def run_task(
@@ -377,7 +418,11 @@ def run_task(
     task = task_suite.get_task(task_id)
 
     # Get initial states
-    initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
+    try:
+        initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
+    except:
+        assert "memory" in cfg.task_suite_name, "Only libero_memory tasks can fail to load initial states!"
+        initial_states, all_initial_states = None, None
 
     # Initialize environment and get task description
     env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
@@ -386,28 +431,30 @@ def run_task(
     task_episodes, task_successes = 0, 0
     for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
         log_message(f"\nTask: {task_description}", log_file)
-
-        # Handle initial state
-        if cfg.initial_states_path == "DEFAULT":
-            # Use default initial state
-            initial_state = initial_states[episode_idx]
+        if initial_states is None:
+            initial_state = None
         else:
-            # Get keys for fetching initial episode state from JSON
-            initial_states_task_key = task_description.replace(" ", "_")
-            episode_key = f"demo_{episode_idx}"
+            # Handle initial state
+            if cfg.initial_states_path == "DEFAULT":
+                # Use default initial state
+                initial_state = initial_states[episode_idx]
+            else:
+                # Get keys for fetching initial episode state from JSON
+                initial_states_task_key = task_description.replace(" ", "_")
+                episode_key = f"demo_{episode_idx}"
 
-            # Skip episode if expert demonstration failed to complete the task
-            if not all_initial_states[initial_states_task_key][episode_key]["success"]:
-                log_message(f"Skipping task {task_id} episode {episode_idx} due to failed expert demo!", log_file)
-                continue
+                # Skip episode if expert demonstration failed to complete the task
+                if not all_initial_states[initial_states_task_key][episode_key]["success"]:
+                    log_message(f"Skipping task {task_id} episode {episode_idx} due to failed expert demo!", log_file)
+                    continue
 
-            # Get initial state
-            initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
+                # Get initial state
+                initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
 
         log_message(f"Starting episode {task_episodes + 1}...", log_file)
 
         # Run episode
-        success, replay_images = run_episode(
+        success, replay_images, total_steps = run_episode(
             cfg,
             env,
             task_description,
@@ -435,6 +482,7 @@ def run_task(
 
         # Log results
         log_message(f"Success: {success}", log_file)
+        log_message(f"Total steps: {total_steps}", log_file)
         log_message(f"# episodes completed so far: {total_episodes}", log_file)
         log_message(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)", log_file)
 

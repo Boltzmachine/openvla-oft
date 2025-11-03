@@ -38,10 +38,10 @@ class RLDSBatchTransform:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
-        if len(rlds_batch["observation"]["image_primary"]) == 2:
-            selected_index = random.randint(0, len(rlds_batch["observation"]["image_primary"]) - 2)
-            other_img = Image.fromarray(rlds_batch["observation"]["image_primary"][selected_index])
-        elif len(rlds_batch["observation"]["image_primary"]) == 1:
+        # if len(rlds_batch["observation"]["image_primary"]) == 2:
+        #     selected_index = random.randint(0, len(rlds_batch["observation"]["image_primary"]) - 2)
+        #     other_img = Image.fromarray(rlds_batch["observation"]["image_primary"][selected_index])
+        if len(rlds_batch["observation"]["image_primary"]) == 1:
             other_img = None
         else:
             img = [Image.fromarray(img_array) for img_array in rlds_batch["observation"]["image_primary"]]

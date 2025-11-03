@@ -431,7 +431,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return self.disentangle_adapter.static_dim
         return None
                 
-    def patch_projector(self, static_ratio):
+    def patch_projector(self, static_ratio=0.5):
         if self.config.disentangle_method == "extra":
             self.config.backbone = "query_transformer"
             self.config.quantizer = "none"
@@ -700,11 +700,15 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
             if isinstance(projected_patch_embeddings, tuple):
                 static, dynamic = projected_patch_embeddings
-                if self.vision_backbone.num_images_in_input > 2:
-                    static['features'] = static['features'].view(pixel_values.size(0), self.vision_backbone.num_images_in_input, -1, static['features'].shape[-1]).mean(dim=1)
+                if self.vision_backbone.num_images_in_input >= 2:
+                    if random.random() < 5:
+                        static['features'] = static['features'].view(pixel_values.size(0), self.vision_backbone.num_images_in_input, -1, static['features'].shape[-1]).mean(dim=1)
+                    else:
+                        static['features'] = static['features'].view(pixel_values.size(0), self.vision_backbone.num_images_in_input, -1, static['features'].shape[-1])[:, -1]
                     projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
                     assert other_pixel_values is None
                 if other_pixel_values is not None:
+                    raise
                     if random.random() < 0.5:
                         projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
                     else:
@@ -1251,7 +1255,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         pixel_values = kwargs["pixel_values"]
         attention_mask = kwargs["attention_mask"]
-
         # Create fake labels tensor (needed for action mask)
         labels = input_ids.clone()
         labels[:] = IGNORE_INDEX
@@ -1276,10 +1279,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Process vision features
         projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        
         if isinstance(projected_patch_embeddings, tuple):
-            projected_patch_embeddings = torch.cat(
-                [projected_patch_embeddings[0]['features'], projected_patch_embeddings[1]], dim=1
-            )
+            static, dynamic = projected_patch_embeddings
+            if self.vision_backbone.num_images_in_input > 2:
+                static['features'] = static['features'].view(pixel_values.size(0), self.vision_backbone.num_images_in_input, -1, static['features'].shape[-1]).mean(dim=1)
+                projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
             
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
@@ -1293,7 +1298,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
 
         # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
-        NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
+        if self.config.disentangle_method != "none":
+            num_static_patches = self.disentangle_adapter.static_dim.item()
+            num_dynamic_patches = self.vision_backbone.get_num_patches() - num_static_patches
+            NUM_PATCHES = num_dynamic_patches * self.vision_backbone.get_num_images_in_input() + num_static_patches
+        else:
+            NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
         if use_proprio:
             NUM_PATCHES += 1
         if use_diffusion:

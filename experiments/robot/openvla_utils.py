@@ -743,9 +743,9 @@ def get_vla_action(
     with torch.inference_mode():
 
         # Collect all input images
-        all_images = [obs["full_image"]]
-        if cfg.num_images_in_input > 1:
-            all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
+        all_images = obs['full_image'] if isinstance(obs['full_image'], list) else [obs["full_image"]]
+        # if cfg.num_images_in_input > 1:
+        #     all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
 
         # Process images
         all_images = prepare_images_for_vla(all_images, cfg)
@@ -761,14 +761,13 @@ def get_vla_action(
 
         # Process additional wrist images if any
         if all_images:
-            all_wrist_inputs = [
-                processor(prompt, image_wrist).to(DEVICE, dtype=torch.bfloat16) for image_wrist in all_images
+            all_remaining_inputs = [
+                processor(prompt, image_remaining).to(DEVICE, dtype=torch.bfloat16) for image_remaining in all_images
             ]
             # Concatenate all images
             primary_pixel_values = inputs["pixel_values"]
-            all_wrist_pixel_values = [wrist_inputs["pixel_values"] for wrist_inputs in all_wrist_inputs]
-            inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
-
+            all_remaining_pixel_values = [remaining_inputs["pixel_values"] for remaining_inputs in all_remaining_inputs]
+            inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_remaining_pixel_values, dim=1)
         # Process proprioception data if used
         proprio = None
         if cfg.use_proprio:
