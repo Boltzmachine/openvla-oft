@@ -418,7 +418,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.llm_dim = config.text_config.hidden_size
 
         if getattr(config, "disentangle_method", "none") != "none":
-            self.patch_projector()
+            self.patch_projector(self.config.static_ratio)
         else:
             self.config.disentangle_method = "none"
 
@@ -431,7 +431,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return self.disentangle_adapter.static_dim
         return None
                 
-    def patch_projector(self, static_ratio=0.5):
+    def patch_projector(self, static_ratio):
         if self.config.disentangle_method == "extra":
             self.config.backbone = "query_transformer"
             self.config.quantizer = "none"
@@ -442,6 +442,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             hidden_dim = 1024
         else:
             raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
+        self.config.static_ratio = static_ratio
         self.disentangle_adapter = DisentangleAdapter(hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer, static_ratio=static_ratio).to(self.language_model.device)
         self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
         
@@ -1282,8 +1283,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         
         if isinstance(projected_patch_embeddings, tuple):
             static, dynamic = projected_patch_embeddings
-            if self.vision_backbone.num_images_in_input > 2:
-                static['features'] = static['features'].view(pixel_values.size(0), self.vision_backbone.num_images_in_input, -1, static['features'].shape[-1]).mean(dim=1)
+            if self.vision_backbone.num_images_in_input >= 2:
+                if random.random() < 5:
+                    static['features'] = static['features'].view(pixel_values.size(0), self.vision_backbone.num_images_in_input, -1, static['features'].shape[-1]).mean(dim=1)
+                else:
+                    static['features'] = static['features'].view(pixel_values.size(0), self.vision_backbone.num_images_in_input, -1, static['features'].shape[-1])[:, -1]
                 projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
             
         # Add proprioceptive features if provided

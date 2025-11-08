@@ -700,7 +700,7 @@ def save_training_checkpoint(
         )
         if cfg.disentangle != "none" and not hasattr(base_vla, "disentangle_adapter"):
             base_vla.config.disentangle_method = cfg.disentangle
-            base_vla.patch_projector(vla.module.disentangle_adapter.original_module.static_ratio)
+            base_vla.patch_projector(cfg.static_ratio)
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
 
