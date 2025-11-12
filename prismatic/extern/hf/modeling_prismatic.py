@@ -263,7 +263,7 @@ class PrismaticVisionBackbone(nn.Module):
             return torch.cat([patches, patches_fused], dim=2)
 
         else:
-            raise
+            assert len(kwargs) == 0, "Additional kwargs not supported for multi-image inputs!"
             assert self.use_fused_vision_backbone, "Multi-image inputs require using fused backbone!"
 
             # Split `pixel_values` into individual images (each with 6 channels: 3 for SigLIP + 3 for DINOv2)
@@ -418,7 +418,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.llm_dim = config.text_config.hidden_size
 
         if getattr(config, "disentangle_method", "none") != "none":
-            self.patch_projector()
+            self.patch_projector(self.config.static_ratio)
         else:
             self.config.disentangle_method = "none"
 
@@ -429,9 +429,13 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
     def n_static_tokens(self):
         if hasattr(self, 'disentangle_adapter'):
             return self.disentangle_adapter.static_dim
+        if hasattr(self.config, "static_ratio"):
+            assert self.vision_backbone.get_num_patches() == 256
+            return int(self.vision_backbone.get_num_patches() * self.config.static_ratio)
+        raise ValueError("Cannot determine number of static tokens!")
         return None
                 
-    def patch_projector(self):
+    def patch_projector(self, static_ratio):
         if "none" not in self.config.disentangle_method:
             if "extra" in self.config.disentangle_method:
                 self.config.backbone = "query_transformer"
@@ -443,7 +447,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 hidden_dim = 1024
             else:
                 raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
-            self.disentangle_adapter = DisentangleAdapter(hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer).to(self.language_model.device)
+            self.disentangle_adapter = DisentangleAdapter(static_ratio=static_ratio, hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer).to(self.language_model.device)
         if 'nce' in self.config.disentangle_method:
             self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
 
@@ -549,7 +553,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 static_dim = self.disentangle_adapter.static_dim
             return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
         elif use_disentangle:
-            static_dim = 128
+            static_dim = self.n_static_tokens
             return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
         else:
             return patch_features
@@ -690,9 +694,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             language_embeddings = input_embeddings[~all_actions_mask].reshape(
                 input_embeddings.shape[0], -1, input_embeddings.shape[2]
             )  # (B, lang_seq_len, llm_dim)
-
-            # other_pixel_values = None
-            if other_pixel_values is not None:
+            if other_pixel_values is not None and getattr(self.config, "invswap_ratio", 1.0) < 1.0:
                 assert not use_film
                 # selected_future_index = torch.randint(0, other_pixel_values.size(1), (1,)).item()
                 other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film, use_disentangle=True)
@@ -704,18 +706,16 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             if isinstance(projected_patch_embeddings, tuple):
                 static, dynamic = projected_patch_embeddings
                 if other_pixel_values is not None:
-                    if random.random() < 0.5:
+                    if random.random() < self.config.invswap_ratio:
                         projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
                     else:
                         projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
                 else:
                     projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
-            
             if hasattr(self, 'attn_pooler'):
                 static['pooling'] = self.attn_pooler(static['features'])
                 other_static['pooling'] = self.attn_pooler(other_static['features'])
                     
-            # projected_patch_embeddings = torch.cat([other_image_features, projected_patch_embeddings], dim=1) if other_pixel_values is not None else projected_patch_embeddings # for memory
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
                 projected_patch_embeddings, proprio, proprio_projector
@@ -1279,11 +1279,18 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=kwargs.get("other_pixel_values", None) is not None)
         if isinstance(projected_patch_embeddings, tuple):
-            projected_patch_embeddings = torch.cat(
-                [projected_patch_embeddings[0]['features'], projected_patch_embeddings[1]], dim=1
-            )
+            static, dynamic = projected_patch_embeddings
+        
+        if (other_pixel_values := kwargs.get("other_pixel_values", None)) is not None:
+            other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film, use_disentangle=True)
+            if isinstance(other_image_features, tuple):
+                other_static, other_dynamic = other_image_features
+                static = other_static
+        
+        if isinstance(projected_patch_embeddings, tuple):
+            projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
             
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None

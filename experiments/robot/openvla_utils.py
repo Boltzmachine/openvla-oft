@@ -722,6 +722,7 @@ def get_vla_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
+    history_image: Optional[np.ndarray] = None,
 ) -> List[np.ndarray]:
     """
     Generate action predictions with the VLA policy.
@@ -768,6 +769,12 @@ def get_vla_action(
             primary_pixel_values = inputs["pixel_values"]
             all_wrist_pixel_values = [wrist_inputs["pixel_values"] for wrist_inputs in all_wrist_inputs]
             inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
+            
+        if history_image is not None:
+            history_image = prepare_images_for_vla([history_image], cfg)[0]
+            history_inputs = processor(prompt, history_image).to(DEVICE, dtype=torch.bfloat16)
+            history_pixel_values = history_inputs["pixel_values"]
+            inputs["other_pixel_values"] = history_pixel_values
 
         # Process proprioception data if used
         proprio = None

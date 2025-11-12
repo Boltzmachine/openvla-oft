@@ -333,7 +333,9 @@ def run_episode(
         observation, img = prepare_observation(obs, resize_size)
         replay_images.append(img)
         replay_observations.append(deepcopy(observation))
-        observation = {'full_image': get_bounded_from_index(replay_observations, -2)['full_image']}
+        history_index = -1 if t % 2 == 0 else -2
+        # observation = {'full_image': get_bounded_from_index(replay_observations, history_index)['full_image']}
+        history_image = None # get_bounded_from_index(replay_observations, history_index)['full_image']
 
         # If action queue is empty, requery model
         if len(action_queue) == 0:
@@ -348,6 +350,7 @@ def run_episode(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 use_film=cfg.use_film,
+                history_image=history_image
             )
             action_queue.extend(actions)
 
@@ -483,6 +486,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
+    results_file = open("rollout.txt", "a")
 
     # Setup logging
     log_file, local_log_filepath, run_id = setup_logging(cfg)
@@ -520,7 +524,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Total episodes: {total_episodes}", log_file)
     log_message(f"Total successes: {total_successes}", log_file)
     log_message(f"Overall success rate: {final_success_rate:.4f} ({final_success_rate * 100:.1f}%)", log_file)
-
+    
+    results_file.write(f"{run_id}\t{final_success_rate:.4f}\n")
+    results_file.close()
     # Log to wandb if enabled
     if cfg.use_wandb:
         wandb.log(
