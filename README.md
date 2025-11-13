@@ -8,7 +8,7 @@ conda activate openvla-oft
 conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.4 -c pytorch -c nvidia
 
 # Clone openvla-oft repo and pip install to download dependencies
-git clone https://github.com/Boltzmachine/openvla-oft.git
+git clone --recurse-submodules https://github.com/Boltzmachine/openvla-oft.git
 cd openvla-oft
 pip install -e .
 
