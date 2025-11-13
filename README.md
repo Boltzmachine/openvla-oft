@@ -31,7 +31,6 @@ pip install -r requirements.txt
 cd ..
 ```
 
-
 # Dataset
 Download from [Huggingface](https://huggingface.co/datasets/openvla/modified_libero_rlds). Rename it to `dataset`.
 The path should look like, for example, `dataset/libero_spatial_no_noops`.
@@ -42,8 +41,15 @@ bash tinglin/train.sh
 ```
 Read the script to adjust the hyperparameters.
 
-#Evaluation
-modify the checkpoint path and run
+# Evaluation
+Install extra libraries
+```
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
+pip install -e LIBERO
+pip install -r experiments/robot/libero/libero_requirements.txt  # From openvla-oft base dir
+```
+
+Modify the checkpoint path and run
 ```
 bash tinglin/eval.sh
 ```
