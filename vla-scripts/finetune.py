@@ -78,7 +78,7 @@ class FinetuneConfig:
     seed: int = 42
     disentangle: str = "none"
     with_memory: bool = False
-    static_ratio: float = 0.5
+    static_ratio: float = 0.0
     invswap_ratio: float = 1.0
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
