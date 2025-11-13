@@ -723,6 +723,7 @@ def get_vla_action(
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
     history_image: Optional[np.ndarray] = None,
+    cache = None,
 ) -> List[np.ndarray]:
     """
     Generate action predictions with the VLA policy.
@@ -787,10 +788,10 @@ def get_vla_action(
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
-            action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
+            action, _, cache = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False, cache=cache)
         else:
             # Custom action head for continuous actions
-            action, _ = vla.predict_action(
+            action, _, cache = vla.predict_action(
                 **inputs,
                 unnorm_key=cfg.unnorm_key,
                 do_sample=False,
@@ -799,10 +800,11 @@ def get_vla_action(
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,
+                cache=cache,
             )
 
     # Return action chunk as list of actions
-    return [action[i] for i in range(len(action))]
+    return [action[i] for i in range(len(action))], cache
 
 
 def get_action_from_server(

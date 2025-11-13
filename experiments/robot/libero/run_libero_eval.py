@@ -319,8 +319,11 @@ def run_episode(
     replay_images = []
     replay_observations = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
+    max_cache_steps = 2 if model.config.static_ratio > 0 else 0
+    cache_steps = 0
 
     # Run episode
+    cache = None
     success = False
     while t < max_steps + cfg.num_steps_wait:
         # Do nothing for the first few timesteps to let objects stabilize
@@ -328,19 +331,18 @@ def run_episode(
             obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
             t += 1
             continue
-
         # Prepare observation
         observation, img = prepare_observation(obs, resize_size)
         replay_images.append(img)
         replay_observations.append(deepcopy(observation))
-        history_index = -1 if t % 2 == 0 else -2
-        # observation = {'full_image': get_bounded_from_index(replay_observations, history_index)['full_image']}
-        history_image = None # get_bounded_from_index(replay_observations, history_index)['full_image']
 
         # If action queue is empty, requery model
         if len(action_queue) == 0:
+            history_index = -1 if cache is None else -9
+            # observation = {'full_image': get_bounded_from_index(replay_observations, history_index)['full_image']}
+            history_image = get_bounded_from_index(replay_observations, history_index)['full_image']
             # Query model to get action
-            actions = get_action(
+            actions, cache = get_action(
                 cfg,
                 model,
                 observation,
@@ -350,16 +352,21 @@ def run_episode(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 use_film=cfg.use_film,
-                history_image=history_image
+                history_image=None, #history_image,
+                cache=cache,
             )
             action_queue.extend(actions)
+            cache_steps += 1
+            if cache_steps >= max_cache_steps:
+                cache_steps = 0
+                cache = None
 
         # Get action from queue
         action = action_queue.popleft()
 
         # Process action
         action = process_action(action, cfg.model_family)
-
+        
         # Execute action in environment
         obs, reward, done, info = env.step(action.tolist())
         if done:
@@ -525,7 +532,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Total successes: {total_successes}", log_file)
     log_message(f"Overall success rate: {final_success_rate:.4f} ({final_success_rate * 100:.1f}%)", log_file)
     
-    results_file.write(f"{run_id}\t{final_success_rate:.4f}\n")
+    results_file.write(f"{cfg.pretrained_checkpoint}\t{final_success_rate:.4f}\n")
     results_file.close()
     # Log to wandb if enabled
     if cfg.use_wandb:
