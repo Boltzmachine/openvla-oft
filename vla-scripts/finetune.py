@@ -180,7 +180,7 @@ def get_run_id(cfg) -> str:
     #         run_id = "--".join(run_id.split("--")[:-1])
     else:
         run_id = (
-            f"b{cfg.batch_size * cfg.grad_accumulation_steps}"
+            f"{cfg.dataset_name}+b{cfg.batch_size * cfg.grad_accumulation_steps}"
             f"+lr-{cfg.learning_rate}"
         )
         if cfg.use_lora:
