@@ -4,14 +4,16 @@ finetune.py
 Fine-tunes OpenVLA via LoRA.
 """
 
+import json
 import os
 import time
 import random
+import shutil
 import numpy as np
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Type
+from typing import Dict, Optional, Tuple, Type, Union
 
 import draccus
 import torch
@@ -74,8 +76,10 @@ def vector_normalize(*xs):
 @dataclass
 class FinetuneConfig:
     seed: int = 42
-    disentangle: str = "extra"
-    static_ratio: float = 0.5
+    disentangle: str = "none"
+    with_memory: bool = False
+    static_ratio: float = 0.0
+    invswap_ratio: float = 1.0
     with_memory: Optional[list] = None
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
@@ -107,8 +111,8 @@ class FinetuneConfig:
     save_freq: int = 10_000                          # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
-    resume: bool = False                             # If True, resumes from checkpoint
-    resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
+    resume: Optional[str] = None                             # If True, resumes from checkpoint
+    resume_dir: Optional[str] = None                         # (When `resume==True`) Path to checkpoint directory
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
@@ -165,28 +169,32 @@ def get_run_id(cfg) -> str:
     Returns:
         str: Experiment run ID.
     """
+    grp_name = cfg.dataset_name
     if cfg.run_id_override is not None:
         # Override the run ID with the user-provided ID
         run_id = cfg.run_id_override
-    elif cfg.resume:
-        # Override run ID with the previous resumed run's ID
-        run_id = cfg.vla_path.split("/")[-1]
-        # Remove the "--XXX_chkpt" suffix from the run ID if it exists
-        if "chkpt" in run_id.split("--")[-1]:
-            run_id = "--".join(run_id.split("--")[:-1])
+    # elif cfg.resume:
+    #     # Override run ID with the previous resumed run's ID
+    #     run_id = cfg.vla_path.split("/")[-1]
+    #     # Remove the "--XXX_chkpt" suffix from the run ID if it exists
+    #     if "chkpt" in run_id.split("--")[-1]:
+    #         run_id = "--".join(run_id.split("--")[:-1])
     else:
         run_id = (
-            f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
-            f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
+            f"{cfg.dataset_name}+b{cfg.batch_size * cfg.grad_accumulation_steps}"
             f"+lr-{cfg.learning_rate}"
         )
         if cfg.use_lora:
-            run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
-        if cfg.image_aug:
-            run_id += "--image_aug"
+            run_id += f"+lora-r{cfg.lora_rank}"
+        # if cfg.image_aug:
+        #     run_id += "--image_aug"
+        run_id += f"+swap-{cfg.invswap_ratio}"
+        run_id += f"+dis-{cfg.disentangle}"
+        run_id += f"+static-{cfg.static_ratio}"
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
-    return run_id
+    print("Experiment Run ID:", run_id)
+    return run_id, grp_name
 
 
 def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu") -> dict:
@@ -266,7 +274,7 @@ def init_module(
     count_parameters(module, module_name)
 
     if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+        state_dict = load_checkpoint(module_name, cfg.resume_dir, cfg.resume_step)
         module.load_state_dict(state_dict)
 
     if to_bf16:
@@ -472,7 +480,7 @@ def run_forward_pass(
             pair_logits.diagonal().copy_(positive_logits)
             nce_loss = F.cross_entropy(pair_logits, torch.arange(len(query), device=query.device))
             metrics['nce_loss'] = nce_loss.item()
-            #loss = loss + 0.01 * nce_loss
+            loss = loss + 0.1 * nce_loss
             
         if 'commit_loss' in static:
             raise
@@ -620,6 +628,8 @@ def save_training_checkpoint(
     run_dir,
     log_step,
     vla,
+    optimizer,
+    scheduler,
     processor,
     proprio_projector,
     noisy_action_projector,
@@ -670,6 +680,13 @@ def save_training_checkpoint(
         # Save processor and LoRA adapter
         processor.save_pretrained(checkpoint_dir)
         vla.module.save_pretrained(adapter_dir)
+        save_cfg(cfg, checkpoint_dir / "finetune_config.json")
+        
+        if optimizer is not None:
+            torch.save(optimizer.state_dict(), checkpoint_dir / f"optimizer--{checkpoint_name_suffix}")
+            
+        if scheduler is not None:
+            torch.save(scheduler.state_dict(), checkpoint_dir / f"scheduler--{checkpoint_name_suffix}")
 
         # Save other components
         if cfg.use_proprio and proprio_projector is not None:
@@ -698,14 +715,13 @@ def save_training_checkpoint(
         base_vla = AutoModelForVision2Seq.from_pretrained(
             cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
         )
-        if cfg.disentangle != "none" and not hasattr(base_vla, "disentangle_adapter"):
-            base_vla.config.disentangle_method = cfg.disentangle
-            base_vla.patch_projector(cfg.static_ratio)
+        postset_model(base_vla, cfg)
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
 
         if distributed_state.is_main_process:
             merged_vla.save_pretrained(checkpoint_dir)
+
             print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
 
         # Wait for merged model to be saved
@@ -812,6 +828,39 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
+    
+    
+def postset_model(vla, cfg):
+    if not hasattr(vla, "disentangle_adapter"):
+        vla.config.invswap_ratio = cfg.invswap_ratio
+        vla.config.static_ratio = cfg.static_ratio
+        vla.config.disentangle_method = cfg.disentangle
+        vla.config.with_memory = cfg.with_memory
+        vla.patch_projector(cfg.static_ratio)
+
+def check_cfg(cfg):
+    if cfg.resume:
+        ref_cfg = json.load(open(os.path.join(cfg.resume_dir, "finetune_config.json"), "r"))
+        keys = ref_cfg.keys()
+        ref_cfg = FinetuneConfig(**ref_cfg)
+        # Check for any changes in the config
+        for key in keys:
+            if key == "vla_path":
+                continue
+            if isinstance(getattr(cfg, key), Path):
+                if str(getattr(cfg, key)) != str(getattr(ref_cfg, key)):
+                    print(f"Config mismatch for key '{key}': {getattr(ref_cfg, key)} (ref) vs {getattr(cfg, key)} (new)")
+            else:
+                if getattr(cfg, key) != getattr(ref_cfg, key):
+                    print(f"Config mismatch for key '{key}': {getattr(ref_cfg, key)} (ref) vs {getattr(cfg, key)} (new)")
+
+
+def save_cfg(cfg, path):
+    cfg = asdict(cfg)
+    for key, value in cfg.items():
+        if isinstance(value, Path):
+            cfg[key] = str(value)
+    json.dump(cfg, open(path, "w"), indent=4)
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
@@ -832,20 +881,22 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.with_memory is not None:
         cfg.num_images_in_input = cfg.with_memory[1] + 1
     
+    check_cfg(cfg)
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
-
-    seed_everything(cfg.seed)
+    
+    resume_step = None
+    if cfg.resume:
+        resume_step = int(cfg.resume_dir.split("--")[-1].split("_")[0])
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
     print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
 
     # Get experiment run ID
-    run_id = get_run_id(cfg)
-
+    run_id, grp_name = get_run_id(cfg)
     # Create experiment run directory
     run_dir = cfg.run_root_dir / run_id
     os.makedirs(run_dir, exist_ok=True)
@@ -855,10 +906,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     device_id = distributed_state.local_process_index
     torch.cuda.set_device(device_id)
     torch.cuda.empty_cache()
+    
+    seed_everything(cfg.seed + device_id)
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
+        resume_from = None# if cfg.resume is None else f"{cfg.resume}?_step={resume_step}"
+        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}", group=grp_name, resume_from=resume_from)
 
     # Print detected constants
     print(
@@ -912,26 +966,29 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # LoRA setup
     if cfg.use_lora:
-        modules_to_save = []
-        if cfg.disentangle:
-            modules_to_save += ["action_predictor", "disentangle_adapter", "attn_pooler"]
+        if cfg.resume:
+            adapter_dir = Path(cfg.resume_dir) / "lora_adapter"
+            postset_model(vla, cfg)
+            vla = PeftModel.from_pretrained(vla, adapter_dir, is_trainable=True)
+        else:
+            modules_to_save = []
+            if cfg.disentangle:
+                modules_to_save += ["action_predictor", "disentangle_adapter", "attn_pooler"]
 
-        lora_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=min(cfg.lora_rank, 16),
-            lora_dropout=cfg.lora_dropout,
-            target_modules={'fc1', 'k_proj', 'lm_head', 'v_proj', 'fc3', 'o_proj', 'q', 'down_proj', 'fc2', 'gate_proj', 'up_proj', 'qkv', 'proj', 'q_proj', 'kv'},
-            init_lora_weights="gaussian",
-            modules_to_save=modules_to_save,
-        )
-        # lora_config = _maybe_include_all_linear_layers(lora_config, vla)
-        
-        if cfg.disentangle != "none" and not hasattr(vla, "disentangle_adapter"):
-            vla.config.disentangle_method = cfg.disentangle
-            vla.patch_projector(cfg.static_ratio)
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=min(cfg.lora_rank, 16),
+                lora_dropout=cfg.lora_dropout,
+                target_modules={'fc1', 'k_proj', 'lm_head', 'v_proj', 'fc3', 'o_proj', 'q', 'down_proj', 'fc2', 'gate_proj', 'up_proj', 'qkv', 'proj', 'q_proj', 'kv'},
+                init_lora_weights="gaussian",
+                modules_to_save=modules_to_save,
+            )
+            # lora_config = _maybe_include_all_linear_layers(lora_config, vla)
             
-        vla = get_peft_model(vla, lora_config)
-        vla.print_trainable_parameters()
+            postset_model(vla, cfg)
+                
+            vla = get_peft_model(vla, lora_config)
+            vla.print_trainable_parameters()
     else:
         raise
         vla.config.disentangle_method = cfg.disentangle
@@ -950,7 +1007,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
         if cfg.resume:
-            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
+            state_dict = load_checkpoint("vision_backbone", cfg.resume_dir, resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
 
@@ -1025,6 +1082,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+    if cfg.resume:
+        optimizer_state_dict = load_checkpoint("optimizer", cfg.resume_dir, resume_step)
+        optimizer.load_state_dict(optimizer_state_dict)
 
     # Record original learning rate
     original_lr = optimizer.param_groups[0]["lr"]
@@ -1032,9 +1092,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Create learning rate scheduler
     scheduler = MultiStepLR(
         optimizer,
-        milestones=[cfg.num_steps_before_decay - cfg.resume_step if cfg.resume_step is not None else cfg.num_steps_before_decay],  # Number of steps after which LR will change
+        milestones=[cfg.num_steps_before_decay - resume_step] if resume_step is not None else [cfg.num_steps_before_decay],  # Number of steps after which LR will change
         gamma=0.1,  # Multiplicative factor of learning rate decay
     )
+    if cfg.resume:
+        scheduler_state_dict = load_checkpoint("scheduler", cfg.resume_dir, resume_step)
+        scheduler.load_state_dict(scheduler_state_dict)
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -1074,8 +1137,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
-        disentangle=cfg.disentangle,
+        disentangle=cfg.static_ratio > 0.0,
         with_memory=cfg.with_memory,
+        skip_step=resume_step and (resume_step * cfg.batch_size * cfg.grad_accumulation_steps * distributed_state.num_processes),
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -1086,7 +1150,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
             train=False,
-            disentangle=cfg.disentangle,
+            disentangle=True,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
@@ -1125,6 +1189,8 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+        if cfg.resume:
+            progress.update(resume_step)
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -1168,7 +1234,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
-            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+            log_step = gradient_step_idx if not cfg.resume else resume_step + gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 
@@ -1203,6 +1269,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                     run_dir=run_dir,
                     log_step=log_step,
                     vla=vla,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
                     processor=processor,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,

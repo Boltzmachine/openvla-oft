@@ -209,7 +209,7 @@ OXE_DATASET_CONFIGS = {
             "wrist": "wrist_image",
         },
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
-        "state_obs_keys": ["EEF_state", "gripper_state"],
+        "state_obs_keys": ["eef_state", "gripper_state"],
         "state_encoding": StateEncoding.POS_EULER,
         "action_encoding": ActionEncoding.EEF_POS,
     },
@@ -505,7 +505,7 @@ OXE_DATASET_CONFIGS = {
     "cmu_stretch": {
         "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
-        "state_obs_keys": ["EEF_state", "gripper_state"],
+        "state_obs_keys": ["eef_state", "gripper_state"],
         "state_encoding": StateEncoding.POS_EULER,
         "action_encoding": ActionEncoding.EEF_POS,
     },

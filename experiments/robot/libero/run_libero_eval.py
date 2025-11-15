@@ -4,6 +4,7 @@ run_libero_eval.py
 Evaluates a trained policy in a LIBERO simulation benchmark task suite.
 """
 
+from copy import deepcopy
 import json
 import logging
 import os
@@ -277,6 +278,14 @@ def process_action(action, model_family):
 
     return action
 
+def get_bounded_from_index(data, index):
+    if index <= 0:
+        if abs(index) > len(data):
+            index = 0
+    else:
+        raise NotImplementedError("Positive indexing not supported.")
+    return data[index]
+
 
 def run_episode(
     cfg: GenerateConfig,
@@ -326,9 +335,13 @@ def run_episode(
     # Setup
     t = 0
     replay_images = []
+    replay_observations = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
+    max_cache_steps = 2 if model.config.static_ratio > 0 else 0
+    cache_steps = 0
 
     # Run episode
+    cache = None
     success = False
     replay_observations = []
     
@@ -357,7 +370,6 @@ def run_episode(
             replay_images.append(img)
             replay_observations.append(deepcopy(observation))
             continue
-
         # Prepare observation
         observation, img = prepare_observation(obs, resize_size)
         replay_images.append(img)
@@ -366,8 +378,11 @@ def run_episode(
 
         # If action queue is empty, requery model
         if len(action_queue) == 0:
+            history_index = -1 if cache is None else -9
+            # observation = {'full_image': get_bounded_from_index(replay_observations, history_index)['full_image']}
+            history_image = get_bounded_from_index(replay_observations, history_index)['full_image']
             # Query model to get action
-            actions = get_action(
+            actions, cache = get_action(
                 cfg,
                 model,
                 observation,
@@ -377,15 +392,21 @@ def run_episode(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 use_film=cfg.use_film,
+                history_image=None, #history_image,
+                cache=cache,
             )
             action_queue.extend(actions)
+            cache_steps += 1
+            if cache_steps >= max_cache_steps:
+                cache_steps = 0
+                cache = None
 
         # Get action from queue
         action = action_queue.popleft()
 
         # Process action
         action = process_action(action, cfg.model_family)
-
+        
         # Execute action in environment
         obs, reward, done, info = env.step(action.tolist())
         if done:
@@ -519,6 +540,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
+    results_file = open("rollout.txt", "a")
 
     # Setup logging
     log_file, local_log_filepath, run_id = setup_logging(cfg)
@@ -556,7 +578,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Total episodes: {total_episodes}", log_file)
     log_message(f"Total successes: {total_successes}", log_file)
     log_message(f"Overall success rate: {final_success_rate:.4f} ({final_success_rate * 100:.1f}%)", log_file)
-
+    
+    results_file.write(f"{cfg.pretrained_checkpoint}\t{final_success_rate:.4f}\n")
+    results_file.close()
     # Log to wandb if enabled
     if cfg.use_wandb:
         wandb.log(
