@@ -263,11 +263,7 @@ class PrismaticVisionBackbone(nn.Module):
             return torch.cat([patches, patches_fused], dim=2)
 
         else:
-<<<<<<< HEAD
-            assert len(kwargs) == 0
-=======
             assert len(kwargs) == 0, "Additional kwargs not supported for multi-image inputs!"
->>>>>>> origin/main
             assert self.use_fused_vision_backbone, "Multi-image inputs require using fused backbone!"
 
             # Split `pixel_values` into individual images (each with 6 channels: 3 for SigLIP + 3 for DINOv2)

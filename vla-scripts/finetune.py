@@ -712,7 +712,7 @@ def save_training_checkpoint(
     # Merge LoRA weights into base model and save resulting model checkpoint
     # Note: Can be very slow on some devices; if so, we recommend merging offline
     if cfg.use_lora and cfg.merge_lora_during_training:
-        base_vla = AutoModelForVision2Seq.from_pretrained(
+        base_vla = OpenVLAForActionPrediction.from_pretrained(
             cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
         )
         postset_model(base_vla, cfg)
@@ -932,17 +932,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     # the `modeling_prismatic.py` file in this codebase; if so, we will copy
     # the file to the downloaded or locally stored checkpoint directory so
     # that the user's changes to the VLA class logic go into effect
-    if model_is_on_hf_hub(cfg.vla_path):
-        # Download model directly from Hugging Face Hub
-        vla_download_path = snapshot_download(repo_id=cfg.vla_path)
-        # Overwrite VLA path
-        cfg.vla_path = vla_download_path
-    else:
-        # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
-        AutoConfig.register("openvla", OpenVLAConfig)
-        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
     # Update config.json and sync model files
     if distributed_state.is_main_process:
@@ -953,8 +942,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     dist.barrier()
 
     # Load processor and VLA
-    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
-    vla = AutoModelForVision2Seq.from_pretrained(
+    processor = PrismaticProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+    vla = OpenVLAForActionPrediction.from_pretrained(
         cfg.vla_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
