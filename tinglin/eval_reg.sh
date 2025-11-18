@@ -6,6 +6,7 @@ cd /opt/tiger/dev
 
 source /mnt/bn/uv-wlv2/envs/oft/bin/activate
 
+python llm_server.py &
 python experiments/robot/libero/run_libero_eval.py \
   --use_l1_regression True \
   --use_diffusion False \
