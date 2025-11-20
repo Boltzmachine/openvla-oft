@@ -118,13 +118,14 @@ class RLDSDataset(IterableDataset):
         train: bool = True,
         image_aug: bool = False,
         disentangle: bool = False,
-        with_memory: Optional[tuple] = None,
+        mem_sep: Optional[int] = None,
+        num_images_in_input: Optional[int] = 1,
         skip_step: Optional[int] = None,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
         self.disentangle = disentangle
-        self.with_memory = with_memory
+        self.mem_sep = mem_sep
 
         # Configure RLDS Dataset(s)
         if self.data_mix in OXE_NAMED_MIXTURES:
@@ -148,14 +149,10 @@ class RLDSDataset(IterableDataset):
             load_language=True,
             action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,
         )
-        if self.with_memory:
-            step_size, n_steps = self.with_memory[0], self.with_memory[1]
-            backward_observation_window_size = list(range(-step_size * n_steps, 1, step_size))
-            assert len(backward_observation_window_size) == n_steps + 1
+        if self.mem_sep:
+            backward_observation_window_size = list(range(-self.mem_sep * (num_images_in_input - 1), 1, self.mem_sep))
+            assert len(backward_observation_window_size) == num_images_in_input
             assert backward_observation_window_size[-1] == 0
-        elif self.disentangle:
-            assert not self.with_memory
-            backward_observation_window_size = 10
         else:
             backward_observation_window_size = 0
         rlds_config = dict(

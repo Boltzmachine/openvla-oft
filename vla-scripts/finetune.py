@@ -77,10 +77,9 @@ def vector_normalize(*xs):
 class FinetuneConfig:
     seed: int = 42
     disentangle: str = "none"
-    with_memory: bool = False
     static_ratio: float = 0.0
     invswap_ratio: float = 1.0
-    with_memory: Optional[list] = None
+    mem_sep: int = 20
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
@@ -835,7 +834,7 @@ def postset_model(vla, cfg):
         vla.config.invswap_ratio = cfg.invswap_ratio
         vla.config.static_ratio = cfg.static_ratio
         vla.config.disentangle_method = cfg.disentangle
-        vla.config.with_memory = cfg.with_memory
+        vla.config.mem_sep = cfg.mem_sep
         vla.patch_projector(cfg.static_ratio)
 
 def check_cfg(cfg):
@@ -878,8 +877,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     Returns:
         None.
     """
-    if cfg.with_memory is not None:
-        cfg.num_images_in_input = cfg.with_memory[1] + 1
     
     check_cfg(cfg)
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
@@ -1045,15 +1042,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
         )
     
-    if cfg.with_memory is not None:
-        if cfg.disentangle != "none":
-            num_static_patches = vla.module.disentangle_adapter.original_module.static_dim.item()
-            num_dynamic_patches = vla.module.vision_backbone.get_num_patches() - num_static_patches
-            NUM_PATCHES = num_dynamic_patches * vla.module.vision_backbone.get_num_images_in_input() + num_static_patches
-        else:
-            NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
-    else:
-        NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
+    num_static_patches = vla.module.n_static_tokens
+    num_dynamic_patches = vla.module.vision_backbone.get_num_patches() - num_static_patches
+    NUM_PATCHES = num_dynamic_patches * vla.module.vision_backbone.get_num_images_in_input() + num_static_patches
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
@@ -1127,7 +1118,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
         disentangle=cfg.static_ratio > 0.0,
-        with_memory=cfg.with_memory,
+        mem_sep=cfg.mem_sep,
+        num_images_in_input=cfg.num_images_in_input,
         skip_step=resume_step and (resume_step * cfg.batch_size * cfg.grad_accumulation_steps * distributed_state.num_processes),
     )
     if cfg.use_val_set:

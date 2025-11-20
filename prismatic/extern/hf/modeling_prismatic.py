@@ -555,8 +555,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 static_dim = self.disentangle_adapter.static_dim
             return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
         elif use_disentangle:
+            patch_features = patch_features.view(patch_features.shape[0] * self.vision_backbone.num_images_in_input, 256, patch_features.shape[-1])
             static_dim = self.n_static_tokens
-            return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
+            return { "features": patch_features[:, :static_dim].reshape(pixel_values.shape[0], -1, patch_features.shape[-1]).contiguous() }, patch_features[:, static_dim:].reshape(pixel_values.shape[0], -1, patch_features.shape[-1]).contiguous()
         else:
             return patch_features
 
@@ -704,7 +705,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                     other_static, other_dynamic = other_image_features
             
             # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=other_pixel_values is not None)
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=getattr(self.config, "static_ratio", 0.0) > 0.0)
             if isinstance(projected_patch_embeddings, tuple):
                 static, dynamic = projected_patch_embeddings
                 if self.vision_backbone.num_images_in_input >= 2:
