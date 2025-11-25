@@ -80,6 +80,7 @@ class FinetuneConfig:
     static_ratio: float = 0.0
     invswap_ratio: float = 1.0
     mem_sep: int = 20
+    use_contrastive: bool = False
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
@@ -298,6 +299,7 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
+    use_contrastive=False
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -472,14 +474,26 @@ def run_forward_pass(
             metrics['static_consistent_loss'] = static_consistent_loss.detach()
             loss = loss + static_consistent_loss
 
-        if 'pooling' in static:
-            query, positive = vector_normalize(static['pooling'], other_static['pooling']) # (B, F)
-            positive_logits = (query * positive).sum(1) # (B)
-            pair_logits = query @ query.T #(B, B)
-            pair_logits.diagonal().copy_(positive_logits)
-            nce_loss = F.cross_entropy(pair_logits, torch.arange(len(query), device=query.device))
-            metrics['nce_loss'] = nce_loss.item()
-            loss = loss + 0.1 * nce_loss
+        if use_contrastive:
+            if 'pooling' in static:
+                query, positive = vector_normalize(static['pooling'], other_static['pooling']) # (B, F)
+                positive_logits = (query * positive).sum(1) # (B)
+                pair_logits = query @ query.T #(B, B)
+                pair_logits.diagonal().copy_(positive_logits)
+                nce_loss = F.cross_entropy(pair_logits, torch.arange(len(query), device=query.device))
+                metrics['nce_loss'] = nce_loss.item()
+                loss = loss + 0.1 * nce_loss
+            else:
+                static_features, other_static_features = map(lambda x: x.transpose(0, 1), vector_normalize(static['features'], other_static['features'])) # (N, B, F)
+                positive_logits = (static_features * other_static_features).sum(-1) # (N, B)
+                pair_logits = static_features @ static_features.transpose(1, 2) #(N, B, B)
+                pair_logits.diagonal(dim1=1, dim2=2).copy_(positive_logits) # (N, B, B)
+                nce_loss = F.cross_entropy(
+                    pair_logits.reshape(-1, pair_logits.size(-1)), # (N*B, B)
+                    torch.arange(pair_logits.size(-1), device=pair_logits.device).repeat(pair_logits.size(0)), # (N*B)
+                )
+                metrics['nce_loss'] = nce_loss.item()
+                loss = loss + 0.1 * nce_loss
             
         if 'commit_loss' in static:
             raise
@@ -786,6 +800,7 @@ def run_validation(
                 num_patches=num_patches,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                use_contrastive=cfg.use_contrastive,
             )
 
             # Add the loss value to the metrics
@@ -1192,6 +1207,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                use_contrastive=cfg.use_contrastive,
             )
 
             # Normalize loss to account for gradient accumulation

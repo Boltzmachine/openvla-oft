@@ -266,25 +266,41 @@ class PrismaticVisionBackbone(nn.Module):
             assert len(kwargs) == 0, "Additional kwargs not supported for multi-image inputs!"
             assert self.use_fused_vision_backbone, "Multi-image inputs require using fused backbone!"
 
-            # Split `pixel_values` into individual images (each with 6 channels: 3 for SigLIP + 3 for DINOv2)
-            images = torch.split(pixel_values, [6] * self.num_images_in_input, dim=1)
+            # # Split `pixel_values` into individual images (each with 6 channels: 3 for SigLIP + 3 for DINOv2)
+            # images = torch.split(pixel_values, [6] * self.num_images_in_input, dim=1)
 
-            # Process each image and collect patches
-            all_patches = []
-            for img in images:
-                # Split each image further into two stacks of channels (each with 3 channels)
-                img_regular, img_fused = torch.split(img, [3, 3], dim=1)
+            # # Process each image and collect patches
+            # all_patches = []
+            # for img in images:
+            #     # Split each image further into two stacks of channels (each with 3 channels)
+            #     img_regular, img_fused = torch.split(img, [3, 3], dim=1)
 
-                # Get patches from both SigLIP and DINOv2 vision transformers
-                patches = self.featurizer(img_regular)
-                patches_fused = self.fused_featurizer(img_fused)
+            #     # Get patches from both SigLIP and DINOv2 vision transformers
+            #     patches = self.featurizer(img_regular)
+            #     patches_fused = self.fused_featurizer(img_fused)
 
-                # Concatenate SigLIP and DINOv2 patches along the hidden dimension
-                combined_patches = torch.cat([patches, patches_fused], dim=2)
-                all_patches.append(combined_patches)
+            #     # Concatenate SigLIP and DINOv2 patches along the hidden dimension
+            #     combined_patches = torch.cat([patches, patches_fused], dim=2)
+            #     all_patches.append(combined_patches)
 
-            # Concatenate all patches along the patch dimension
-            return torch.cat(all_patches, dim=1)
+            # # Concatenate all patches along the patch dimension
+            # return torch.cat(all_patches, dim=1)
+
+            # pixel_values : [bsz, num_images_in_input * 6, resolution, resolution]
+            B, _, H, W = pixel_values.shape
+            pixel_values = pixel_values.view(B, self.num_images_in_input, 6, H, W)
+            # split channels: (B, N, 3, H, W) each
+            img_regular = pixel_values[:, :, :3]   # SigLIP
+            img_fused   = pixel_values[:, :, 3:]   # DINOv2
+
+            # merge batch and image dims → (B*N, 3, H, W)
+            img_regular = img_regular.reshape(B * self.num_images_in_input, 3, H, W).contiguous()
+            img_fused   = img_fused.reshape(B * self.num_images_in_input, 3, H, W).contiguous()
+
+            patches = self.featurizer(img_regular)  # (B*N, num_patches, feat_dim1)
+            patches_fused = self.fused_featurizer(img_fused)  # (B*N, num_patches, feat_dim2)
+
+            return torch.cat([patches, patches_fused], dim=2).view(B, self.num_images_in_input * patches.size(1), patches.size(2) + patches_fused.size(2))  # (B, N, num_patches, feat_dim1 + feat_dim2)
 
 
 # === Prismatic Projector (nn.Module) Definitions ===
@@ -1054,188 +1070,119 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             labels=None,
             use_cache=None,
             output_attentions=False,
-            output_hidden_states=False,
-            return_dict=True,
-        )
-
-        # Extract hidden states for action tokens
-        #last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
-        # actions_hidden_states = last_hidden_states[
-        #     :,
-        #     NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-        #     :,
-        # ]  # (B, act_chunk_len, D)
-
-        # Handle different prediction methods
-        # if action_head is not None:
-        #     # L1 regression prediction
-        #     normalized_actions = action_head.predict_action(actions_hidden_states)
-        #     normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
-        #     normalized_actions = normalized_actions.float().cpu().detach().numpy()
-        # else:
-        # Discrete token-based prediction
-        
-        #test 
-        # NUM_PROMPT_TOKENS = NUM_PROMPT_TOKENS + NUM_PATCHES
-        # j = torch.arange(language_model_output.logits.shape[1], device=NUM_PROMPT_TOKENS.device)
-        # start = NUM_PROMPT_TOKENS.unsqueeze(1)
-        # end = start + ACTION_DIM * NUM_ACTIONS_CHUNK
-        # mask_2d = (j >= start) & (j < end)
-        # mask = mask_2d.unsqueeze(-1) 
-        # actions_masks = mask.expand_as(language_model_output.logits)  
-        
-        
-        NUM_PROMPT_TOKENS = NUM_PROMPT_TOKENS + NUM_PATCHES
-        batch_size = language_model_output.logits.shape[0]
-        device = language_model_output.logits.device
-        
-        if cache is not None:
-            NUM_PROMPT_TOKENS = NUM_PROMPT_TOKENS - cache_length
-       
-        start_indices = torch.tensor([NUM_PROMPT_TOKENS], device=device).unsqueeze(1)  # [batch_size, 1]
-        position_offsets = torch.arange(ACTION_DIM * NUM_ACTIONS_CHUNK, device=device).unsqueeze(0)  # [1, seq_length]
-        seq_indices = start_indices + position_offsets  # [batch_size, ACTION_DIM*NUM_ACTIONS_CHUNK]
-        #test end
-        #test add
-        #print("language_model_output",language_model_output.logits.shape[-1])
-        #print("self.vocab_size",self.vocab_size) 32000
-        #topk_values, topk_indices = torch.topk(language_model_output.logits, k=256, dim=-1)
-        #print(topk_indices)
-        #assert language_model_output.logits.shape[-1] == self.vocab_size
-        #test add
-        do_sample = False
-        if do_sample == False:
-            #org
-            # reponse_ids = language_model_output.logits[
-            #         :,
-            #         NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-            #     ].argmax(dim=2)
-            #reponse_ids = language_model_output.logits[actions_masks].argmax(dim=2)
-            #org end
-            
-            #padding
-            # reponse_ids = language_model_output.logits[
-            #     torch.arange(batch_size, device=device).unsqueeze(-1),  
-            #     seq_indices, 
-            #     :
-            # ].argmax(dim=2)  
-            #padding end
-            
-            #padding + only get last 256 token
-            reponse_ids_logits = language_model_output.logits[
-                torch.arange(batch_size, device=device).unsqueeze(-1),  
-                seq_indices, 
-                :
-            ]
-            start_index = self.vocab_size - 256 
-            response_last256 = reponse_ids_logits[..., -256-64:-64]  # Shape: [batch_size, seq_len, 256]
-            last256_argmax = response_last256.argmax(dim=-1)  # Shape: [batch_size, seq_len]
-            reponse_ids = last256_argmax + start_index  # Shape: [batch_size, seq_len]
-            #padding + only get last 256 token end
-            
-            predicted_action_token_ids = reponse_ids.cpu().numpy()
-                
-        else:
-            assert temperature>0
-            #org 
-            # action_logits  = language_model_output.logits[
-            #         :,
-            #         NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-            #     ]
-            #action_logits = language_model_output.logits[actions_masks]
-            #org end
-            
-            action_logits = language_model_output.logits[
-                torch.arange(batch_size, device=device).unsqueeze(-1),  
-                seq_indices, 
-                :
-            ]  
-            # padding 
-            # scaled_logits = action_logits / temperature
-            # probs = torch.softmax(scaled_logits, dim=-1)
-            # probs_flat = probs.reshape(-1, probs.shape[-1])  # (B*act_chunk_len, vocab_size)
-            # sampled_indices_flat = torch.multinomial(probs_flat, num_samples=1)  # (B*act_chunk_len, 1)
-            # reponse_ids = sampled_indices_flat.view(action_logits.shape[0], -1)
-            # padding end 
-            
-            #padding + only get last 256 token
-            action_logits_last256 = action_logits[..., -256-64:-64]
-            scaled_logits = action_logits_last256 / temperature
-            probs = torch.softmax(scaled_logits, dim=-1)
-            assert probs.shape[-1] == 256
-            probs_flat = probs.reshape(-1, probs.shape[-1])
-            sampled_indices_flat = torch.multinomial(probs_flat, num_samples=1)
-            original_ids_flat = sampled_indices_flat + (self.vocab_size - 256)
-            reponse_ids = original_ids_flat.view(action_logits.shape[0], -1)
-            #padding + only get last 256 token end
-            
-            predicted_action_token_ids = reponse_ids.cpu().numpy()
-     
-        discretized_actions = self.vocab_size - predicted_action_token_ids
-        discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
-        normalized_actions = self.bin_centers[discretized_actions]
-        #normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
-        normalized_actions = normalized_actions.reshape(-1, ACTION_DIM)
-
-        return normalized_actions, reponse_ids, language_model_output.past_key_values
-        #return normalized_actions, actions_hidden_states
-
-        """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
-        # Zero out action token embeddings
-        all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
-        input_embeddings = input_embeddings * ~all_actions_mask
-
-        # Build multimodal embeddings and attention mask
-        multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
-            input_embeddings, projected_patch_embeddings, attention_mask
-        )
-
-        # Forward pass through language model
-        language_model_output = self.language_model(
-            input_ids=None,
-            attention_mask=multimodal_attention_mask,
-            position_ids=None,
-            past_key_values=None,
-            inputs_embeds=multimodal_embeddings,
-            labels=None,
-            use_cache=None,
-            output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
         )
+        
+        if cache is not None:
+            NUM_PROMPT_TOKENS = NUM_PROMPT_TOKENS - cache_length
 
-        # Extract hidden states for action tokens
-        last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
-        actions_hidden_states = last_hidden_states[
-            :,
-            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-            :,
-        ]  # (B, act_chunk_len, D)
-
-        # Handle different prediction methods
         if action_head is not None:
+            # Extract hidden states for action tokens
+            last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
+            actions_hidden_states = last_hidden_states[
+                :,
+                NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+                :,
+            ]  # (B, act_chunk_len, D)
+
             # L1 regression prediction
             normalized_actions = action_head.predict_action(actions_hidden_states)
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
+            reponse_ids = None
         else:
-            # Discrete token-based prediction
-            predicted_action_token_ids = (
-                language_model_output.logits[
-                    :,
-                    NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+            NUM_PROMPT_TOKENS = NUM_PROMPT_TOKENS + NUM_PATCHES
+            batch_size = language_model_output.logits.shape[0]
+            device = language_model_output.logits.device
+        
+            start_indices = torch.tensor([NUM_PROMPT_TOKENS], device=device).unsqueeze(1)  # [batch_size, 1]
+            position_offsets = torch.arange(ACTION_DIM * NUM_ACTIONS_CHUNK, device=device).unsqueeze(0)  # [1, seq_length]
+            seq_indices = start_indices + position_offsets  # [batch_size, ACTION_DIM*NUM_ACTIONS_CHUNK]
+            #test end
+            #test add
+            #print("language_model_output",language_model_output.logits.shape[-1])
+            #print("self.vocab_size",self.vocab_size) 32000
+            #topk_values, topk_indices = torch.topk(language_model_output.logits, k=256, dim=-1)
+            #print(topk_indices)
+            #assert language_model_output.logits.shape[-1] == self.vocab_size
+            #test add
+            do_sample = False
+            if do_sample == False:
+                #org
+                # reponse_ids = language_model_output.logits[
+                #         :,
+                #         NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+                #     ].argmax(dim=2)
+                #reponse_ids = language_model_output.logits[actions_masks].argmax(dim=2)
+                #org end
+                
+                #padding
+                # reponse_ids = language_model_output.logits[
+                #     torch.arange(batch_size, device=device).unsqueeze(-1),  
+                #     seq_indices, 
+                #     :
+                # ].argmax(dim=2)  
+                #padding end
+                
+                #padding + only get last 256 token
+                reponse_ids_logits = language_model_output.logits[
+                    torch.arange(batch_size, device=device).unsqueeze(-1),  
+                    seq_indices, 
+                    :
                 ]
-                .argmax(dim=2)
-                .cpu()
-                .numpy()
-            )
+                start_index = self.vocab_size - 256 
+                response_last256 = reponse_ids_logits[..., -256-64:-64]  # Shape: [batch_size, seq_len, 256]
+                last256_argmax = response_last256.argmax(dim=-1)  # Shape: [batch_size, seq_len]
+                reponse_ids = last256_argmax + start_index  # Shape: [batch_size, seq_len]
+                #padding + only get last 256 token end
+                
+                predicted_action_token_ids = reponse_ids.cpu().numpy()
+                    
+            else:
+                assert temperature>0
+                #org 
+                # action_logits  = language_model_output.logits[
+                #         :,
+                #         NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+                #     ]
+                #action_logits = language_model_output.logits[actions_masks]
+                #org end
+                
+                action_logits = language_model_output.logits[
+                    torch.arange(batch_size, device=device).unsqueeze(-1),  
+                    seq_indices, 
+                    :
+                ]  
+                # padding 
+                # scaled_logits = action_logits / temperature
+                # probs = torch.softmax(scaled_logits, dim=-1)
+                # probs_flat = probs.reshape(-1, probs.shape[-1])  # (B*act_chunk_len, vocab_size)
+                # sampled_indices_flat = torch.multinomial(probs_flat, num_samples=1)  # (B*act_chunk_len, 1)
+                # reponse_ids = sampled_indices_flat.view(action_logits.shape[0], -1)
+                # padding end 
+                
+                #padding + only get last 256 token
+                action_logits_last256 = action_logits[..., -256-64:-64]
+                scaled_logits = action_logits_last256 / temperature
+                probs = torch.softmax(scaled_logits, dim=-1)
+                assert probs.shape[-1] == 256
+                probs_flat = probs.reshape(-1, probs.shape[-1])
+                sampled_indices_flat = torch.multinomial(probs_flat, num_samples=1)
+                original_ids_flat = sampled_indices_flat + (self.vocab_size - 256)
+                reponse_ids = original_ids_flat.view(action_logits.shape[0], -1)
+                #padding + only get last 256 token end
+                
+                predicted_action_token_ids = reponse_ids.cpu().numpy()
+        
             discretized_actions = self.vocab_size - predicted_action_token_ids
             discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
             normalized_actions = self.bin_centers[discretized_actions]
-            normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+            #normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+            normalized_actions = normalized_actions.reshape(-1, ACTION_DIM)
 
-        return normalized_actions, actions_hidden_states
-
+        return normalized_actions, reponse_ids, language_model_output.past_key_values
+    
     def truncate_cache(
         self,
         past_key_values

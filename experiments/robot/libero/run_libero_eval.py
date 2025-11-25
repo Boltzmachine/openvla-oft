@@ -395,7 +395,7 @@ def run_episode(
                 noisy_action_projector=noisy_action_projector,
                 use_film=cfg.use_film,
                 history_image=None, #history_image,
-                cache=cache,
+                cache=None#cache,
             )
             action_queue.extend(actions)
             cache_steps += 1
