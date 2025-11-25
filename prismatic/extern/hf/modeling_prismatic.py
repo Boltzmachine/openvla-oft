@@ -1305,7 +1305,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=True)
         
         if isinstance(projected_patch_embeddings, tuple):
             static, dynamic = projected_patch_embeddings
@@ -1328,12 +1328,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
 
         # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
-        if self.config.disentangle_method != "none":
-            num_static_patches = self.disentangle_adapter.static_dim.item()
-            num_dynamic_patches = self.vision_backbone.get_num_patches() - num_static_patches
-            NUM_PATCHES = num_dynamic_patches * self.vision_backbone.get_num_images_in_input() + num_static_patches
-        else:
-            NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
+        num_static_patches = self.n_static_tokens
+        num_dynamic_patches = self.vision_backbone.get_num_patches() - num_static_patches
+        NUM_PATCHES = num_dynamic_patches * self.vision_backbone.get_num_images_in_input() + num_static_patches
         if use_proprio:
             NUM_PATCHES += 1
         if use_diffusion:

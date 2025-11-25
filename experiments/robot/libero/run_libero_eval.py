@@ -299,6 +299,7 @@ def run_episode(
     noisy_action_projector=None,
     initial_state=None,
     log_file=None,
+    episode_idx: int = 0,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -306,16 +307,17 @@ def run_episode(
         retry = 0
         while True:
             try:
+                np.random.seed(episode_idx * 100 + retry)
                 env.reset()
                 env.env.init_moving_params()
                 break
             except Exception as e:
                 print(retry,e, file=open("log.txt", "a"))
                 retry += 1
-        env.env.moving_counter = -10
+        env.env.moving_controller.counter = -10
         for _ in range(10):
             obs, reward, done, info = env.step(get_libero_dummy_action("llava"))
-        assert env.env.moving_counter == 0, "Environment failed to settle after reset!"
+        assert env.env.moving_controller.counter == 0, "Environment failed to settle after reset!"
     else:
         env.reset()
 
@@ -374,8 +376,8 @@ def run_episode(
         observation, img = prepare_observation(obs, resize_size)
         replay_images.append(img)
         replay_observations.append(deepcopy(observation))
-        observation = { 'full_image': get_past_observations(replay_observations, [-37, -25, -13, -1]) }
-
+        observation = { 'full_image': get_past_observations(replay_observations, list(range(-1 - (model.vision_backbone.get_num_images_in_input()-1) * model.config.mem_sep, 0, model.config.mem_sep)) ) }
+        # observation = { 'full_image': get_past_observations(replay_observations, [-100000, -1]) }
         # If action queue is empty, requery model
         if len(action_queue) == 0:
             history_index = -1 if cache is None else -9
@@ -487,6 +489,7 @@ def run_task(
             noisy_action_projector,
             initial_state,
             log_file,
+            episode_idx
         )
 
         # Update counters
