@@ -1,7 +1,7 @@
-torchrun --standalone --nnodes 1 --nproc-per-node 4 vla-scripts/finetune.py \
-  --disentangle extra \
-  --static_ratio 0.5 \
-  --with_memory "[1000, 1]"\
+torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
+  --disentangle none \
+  --static_ratio 0.8 \
+  --mem_sep 40 \
   --vla_path openvla/openvla-7b \
   --data_root_dir dataset/ \
   --dataset_name libero_memory \
@@ -9,7 +9,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node 4 vla-scripts/finetune.py \
   --use_l1_regression False \
   --use_diffusion False \
   --use_film False \
-  --num_images_in_input 1 \
+  --num_images_in_input 3 \
   --use_proprio False \
   --batch_size 4 \
   --grad_accumulation_steps 4 \
