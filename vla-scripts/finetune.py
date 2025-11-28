@@ -81,6 +81,7 @@ class FinetuneConfig:
     static_ratio: float = 0.0
     invswap_ratio: float = 1.0
     use_contrastive: bool = False
+    backward_window_size: int = 10
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
@@ -130,6 +131,8 @@ class FinetuneConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
+    
+    run_id: Optional[str] = None                     # only post
 
     # fmt: on
 
@@ -191,6 +194,7 @@ def get_run_id(cfg) -> str:
         run_id += f"+swap-{cfg.invswap_ratio}"
         run_id += f"+dis-{cfg.disentangle}"
         run_id += f"+static-{cfg.static_ratio}"
+        run_id += f'+bw-{cfg.backward_window_size}'
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
     print("Experiment Run ID:", run_id)
@@ -254,6 +258,7 @@ def init_module(
     module_args: dict,
     to_bf16: bool = False,
     find_unused_params: bool = False,
+    resume_step=None,
 ) -> DDP:
     """
     Initializes a module, optionally loads checkpoint, moves to device, and wraps with DDP.
@@ -274,7 +279,7 @@ def init_module(
     count_parameters(module, module_name)
 
     if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.resume_dir, cfg.resume_step)
+        state_dict = load_checkpoint(module_name, cfg.resume_dir, resume_step)
         module.load_state_dict(state_dict)
 
     if to_bf16:
@@ -649,6 +654,7 @@ def save_training_checkpoint(
     action_head,
     train_dataset,
     distributed_state,
+    modeling_file,
 ) -> None:
     """
     Save all training checkpoints including model components, LoRA adapter, and dataset statistics.
@@ -691,6 +697,7 @@ def save_training_checkpoint(
     # Save model components (main process only)
     if distributed_state.is_main_process:
         # Save processor and LoRA adapter
+        open(checkpoint_dir / "modeling_prismatic.py", "w").write(modeling_file)
         processor.save_pretrained(checkpoint_dir)
         vla.module.save_pretrained(adapter_dir)
         save_cfg(cfg, checkpoint_dir / "finetune_config.json")
@@ -849,16 +856,17 @@ def postset_model(vla, cfg):
         vla.config.invswap_ratio = cfg.invswap_ratio
         vla.config.static_ratio = cfg.static_ratio
         vla.config.disentangle_method = cfg.disentangle
+        vla.config.backward_window_size = cfg.backward_window_size
         vla.patch_projector(cfg.static_ratio)
 
 def check_cfg(cfg):
     if cfg.resume:
-        ref_cfg = json.load(open(os.path.join(cfg.resume_dir, "finetune_config.json"), "r"))
-        keys = ref_cfg.keys()
-        ref_cfg = FinetuneConfig(**ref_cfg)
+        ref_conf = json.load(open(os.path.join(cfg.resume_dir, "finetune_config.json"), "r"))
+        keys = ref_conf.keys()
+        ref_cfg = FinetuneConfig(**{key: value for key, value in ref_conf.items() if key != "run_id"})
         # Check for any changes in the config
         for key in keys:
-            if key == "vla_path":
+            if key == "vla_path" or key == 'run_id':
                 continue
             if isinstance(getattr(cfg, key), Path):
                 if str(getattr(cfg, key)) != str(getattr(ref_cfg, key)):
@@ -866,7 +874,7 @@ def check_cfg(cfg):
             else:
                 if getattr(cfg, key) != getattr(ref_cfg, key):
                     print(f"Config mismatch for key '{key}': {getattr(ref_cfg, key)} (ref) vs {getattr(cfg, key)} (new)")
-
+        return FinetuneConfig(**ref_conf)
 
 def save_cfg(cfg, path):
     cfg = asdict(cfg)
@@ -891,7 +899,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     Returns:
         None.
     """
-    check_cfg(cfg)
+    modeling_file = open("prismatic/extern/hf/modeling_prismatic.py").read()
+    possible_ref_cfg = check_cfg(cfg)
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
@@ -907,6 +916,11 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Get experiment run ID
     run_id, grp_name = get_run_id(cfg)
+    if cfg.resume:
+        run_id = possible_ref_cfg.run_id
+        if possible_ref_cfg.run_id_note is not None:
+            run_id += f"--{possible_ref_cfg.run_id_note}"
+    cfg.run_id = run_id
     # Create experiment run directory
     run_dir = cfg.run_root_dir / run_id
     os.makedirs(run_dir, exist_ok=True)
@@ -922,7 +936,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Initialize wandb logging
     if distributed_state.is_main_process:
         resume_from = None# if cfg.resume is None else f"{cfg.resume}?_step={resume_step}"
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}", group=grp_name, resume_from=resume_from)
+        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"{run_id}", group=grp_name, resume_from=resume_from)
 
     # Print detected constants
     print(
@@ -1034,6 +1048,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
+            resume_step=resume_step,
         )
 
     # If applicable, instantiate continuous action head for L1 regression
@@ -1045,6 +1060,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             device_id,
             {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
             to_bf16=True,
+            resume_step=resume_step,
         )
 
     # If applicable, instantiate diffusion action head and noisy action projector
@@ -1061,9 +1077,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "num_diffusion_steps_train": cfg.num_diffusion_steps_train,
             },
             to_bf16=True,
+            resume_step=resume_step,
         )
         noisy_action_projector = init_module(
-            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
+            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim},
+            resume_step=resume_step,
         )
 
     # Get number of vision patches
@@ -1143,6 +1161,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         disentangle=cfg.static_ratio > 0.0,
         with_memory=cfg.with_memory,
         skip_step=resume_step and (resume_step * cfg.batch_size * cfg.grad_accumulation_steps * distributed_state.num_processes),
+        backward_window_size=cfg.backward_window_size,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -1153,7 +1172,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
             train=False,
-            disentangle=True,
+            disentangle=cfg.static_ratio > 0.0,
+            backward_window_size=cfg.backward_window_size,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
@@ -1180,6 +1200,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             collate_fn=collator,
             num_workers=0,  # Important: Set to 0 if using RLDS, which uses its own parallelism
         )
+
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_metrics = {
@@ -1281,6 +1302,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
+                    modeling_file=modeling_file
                 )
 
             # Test model on validation set
