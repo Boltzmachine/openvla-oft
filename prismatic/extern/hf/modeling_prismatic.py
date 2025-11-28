@@ -38,7 +38,9 @@ from prismatic.vla.constants import (
 )
 
 from .configuration_prismatic import OpenVLAConfig, PrismaticConfig
-
+import os
+INSPECT_LAYER_IMPORTANCE = os.getenv("INSPECT_LAYER_IMPORTANCE", "0") == "1"
+USE_CAUSAL = os.getenv("USE_CAUSAL", "1") == "1"
 # Set up logger
 logger = logging.getLogger(__name__)
 
@@ -758,7 +760,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
             # Build labels for multimodal sequence if needed
             multimodal_labels = self._build_multimodal_labels(labels, projected_patch_embeddings)
-            action_token_mask = torch.cat([all_actions_mask[:, :1], torch.zeros(projected_patch_embeddings.size(0), projected_patch_embeddings.size(1), 1, device=all_actions_mask.device, dtype=all_actions_mask.dtype), all_actions_mask[:, 1:]], dim=1)
+            action_token_mask = torch.cat([all_actions_mask[:, :1], torch.zeros(projected_patch_embeddings.size(0), projected_patch_embeddings.size(1), 1, device=all_actions_mask.device, dtype=all_actions_mask.dtype), all_actions_mask[:, 1:]], dim=1) if USE_CAUSAL else None
 
             # Dispatch to language model
             language_model_output = self.language_model(
@@ -771,9 +773,21 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 action_token_mask=action_token_mask,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
+                output_hidden_states=output_hidden_states if not INSPECT_LAYER_IMPORTANCE else True,
                 return_dict=return_dict,
             )
+
+            if INSPECT_LAYER_IMPORTANCE:
+                if not hasattr(self, "layer_importance_scores"):
+                    self.layer_importance_scores = [[] for _ in range(len(language_model_output.hidden_states) - 1)]
+                if len(self.layer_importance_scores[0]) >= 10:
+                    layer_importance_scores = [1 - sum(layer_scores) / len(layer_scores) for layer_scores in self.layer_importance_scores]
+                    topk_indices = sorted(range(len(layer_importance_scores)), key=lambda i: layer_importance_scores[i])[:3]
+                    import ipdb; ipdb.set_trace()
+                for layer_idx, layer_hidden_states in enumerate(language_model_output.hidden_states[:-1]):
+                    next_layer_hidden_states = language_model_output.hidden_states[layer_idx + 1]
+                    cos_similarity = torch.nn.functional.cosine_similarity(layer_hidden_states, next_layer_hidden_states, dim=-1)
+                    self.layer_importance_scores[layer_idx].extend(cos_similarity.mean(-1).tolist())
 
         # === Otherwise =>> Assume Invalid! ===
         elif (input_ids.shape[0] != pixel_values.shape[0]) or (inputs_embeds.shape[0] != pixel_values.shape[0]):
@@ -1030,7 +1044,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
             input_embeddings, projected_patch_embeddings, attention_mask
         )
-        action_token_mask = torch.cat([all_actions_mask[:, :1], torch.zeros(projected_patch_embeddings.size(0), projected_patch_embeddings.size(1), 1, device=all_actions_mask.device, dtype=all_actions_mask.dtype), all_actions_mask[:, 1:]], dim=1)
+        action_token_mask = torch.cat([all_actions_mask[:, :1], torch.zeros(projected_patch_embeddings.size(0), projected_patch_embeddings.size(1), 1, device=all_actions_mask.device, dtype=all_actions_mask.dtype), all_actions_mask[:, 1:]], dim=1) if USE_CAUSAL else None
         # Forward pass through language model
         if cache is not None:
             cache_length = cache[0][0].shape[2]

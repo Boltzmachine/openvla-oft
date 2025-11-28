@@ -76,6 +76,7 @@ def vector_normalize(*xs):
 @dataclass
 class FinetuneConfig:
     seed: int = 42
+    use_causal: bool = True
     disentangle: str = "none"
     with_memory: bool = False
     static_ratio: float = 0.0
@@ -849,6 +850,7 @@ def postset_model(vla, cfg):
         vla.config.invswap_ratio = cfg.invswap_ratio
         vla.config.static_ratio = cfg.static_ratio
         vla.config.disentangle_method = cfg.disentangle
+        vla.config.use_causal = cfg.use_causal
         vla.patch_projector(cfg.static_ratio)
 
 def check_cfg(cfg):
