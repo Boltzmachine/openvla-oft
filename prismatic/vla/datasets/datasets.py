@@ -114,6 +114,7 @@ class RLDSDataset(IterableDataset):
         disentangle: bool = False,
         with_memory: bool = False,
         skip_step: Optional[int] = None,
+        backward_window_size: int = 0,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -146,7 +147,7 @@ class RLDSDataset(IterableDataset):
             backward_observation_window_size = 100000000
         elif self.disentangle:
             assert not self.with_memory
-            backward_observation_window_size = 10
+            backward_observation_window_size = backward_window_size
         else:
             backward_observation_window_size = 0
         rlds_config = dict(

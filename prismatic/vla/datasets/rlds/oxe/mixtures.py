@@ -14,7 +14,10 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
         # ("bridge_oxe", 1.0),                                    # Version of Bridge V2 in Open-X GCP Bucket
         ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
     ],
-
+    
+    "fractal": [
+        ("fractal20220817_data", 1.0),                          # Google RT-1 Robot Data (Large-Scale)
+    ],
 
     # === [Moderate-Scale] Bridge++ Mixtures ===
     "bridge_rt_1": [

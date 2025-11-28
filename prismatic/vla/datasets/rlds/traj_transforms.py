@@ -27,8 +27,8 @@ def chunk_act_obs(traj: Dict, window_size: int, backward_observation_window_size
     effective_traj_len = traj_len - future_action_window_size
 
     if backward_observation_window_size > 0:
-        if backward_observation_window_size < 1000:
-            backward_observation_window_size = random_int = tf.random.uniform(shape=[], minval=1, maxval=11, dtype=tf.int32)
+        if backward_observation_window_size < 10000:
+            backward_observation_window_size = tf.random.uniform(shape=[], minval=1, maxval=backward_observation_window_size+1, dtype=tf.int32)
         chunk_indices = tf.broadcast_to(tf.concat([[-backward_observation_window_size], tf.range(-window_size + 1, 1)], axis=0), [effective_traj_len, window_size+1]) + tf.broadcast_to(
         tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size+1]
         )
