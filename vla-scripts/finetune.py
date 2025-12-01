@@ -42,6 +42,8 @@ from experiments.robot.openvla_utils import (
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.modeling_memoryvla import MemoryVLAForActionPrediction
+from prismatic.extern.hf.modeling_contextvla import ContextVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
@@ -76,6 +78,7 @@ def vector_normalize(*xs):
 @dataclass
 class FinetuneConfig:
     seed: int = 42
+    baseline: str = "none"
     disentangle: str = "none"
     static_ratio: float = 0.0
     invswap_ratio: float = 1.0
@@ -133,6 +136,24 @@ class FinetuneConfig:
 
     # fmt: on
 
+
+def initialize_vla(cfg):
+    if cfg.baseline == "memoryvla":
+        model_class = MemoryVLAForActionPrediction
+    elif cfg.baseline == "contextvla":
+        model_class = ContextVLAForActionPrediction
+    elif cfg.baseline == "none":
+        model_class = OpenVLAForActionPrediction
+    else:
+        raise ValueError(f"Unknown baseline: {cfg.baseline}")
+    
+    vla = model_class.from_pretrained(
+            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+    )
+    if cfg.baseline == "memoryvla":
+        vla.patch_compressor()
+    return vla
+        
 
 def remove_ddp_in_checkpoint(state_dict) -> dict:
     """
@@ -725,9 +746,7 @@ def save_training_checkpoint(
     # Merge LoRA weights into base model and save resulting model checkpoint
     # Note: Can be very slow on some devices; if so, we recommend merging offline
     if cfg.use_lora and cfg.merge_lora_during_training:
-        base_vla = OpenVLAForActionPrediction.from_pretrained(
-            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
-        )
+        base_vla = initialize_vla(cfg)
         postset_model(base_vla, cfg)
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
@@ -955,12 +974,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Load processor and VLA
     processor = PrismaticProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
-    vla = OpenVLAForActionPrediction.from_pretrained(
-        cfg.vla_path,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    ).to(device_id)
+    vla = initialize_vla(cfg).to(device_id)
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -1057,15 +1071,21 @@ def finetune(cfg: FinetuneConfig) -> None:
             NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
         )
     
-    num_static_patches = vla.module.n_static_tokens
-    num_dynamic_patches = vla.module.vision_backbone.get_num_patches() - num_static_patches
-    NUM_PATCHES = num_dynamic_patches * vla.module.vision_backbone.get_num_images_in_input() + num_static_patches
+    if cfg.baseline == "none":
+        num_static_patches = vla.module.n_static_tokens
+        num_dynamic_patches = vla.module.vision_backbone.get_num_patches() - num_static_patches
+        NUM_PATCHES = num_dynamic_patches * vla.module.vision_backbone.get_num_images_in_input() + num_static_patches
+    elif cfg.baseline == "contextvla":
+        NUM_PATCHES = vla.module.vision_backbone.get_num_patches() + 1
+    else:
+        raise NotImplementedError
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
     # For diffusion, a single diffusion timestep embedding is appended to the end of the vision patch embeddings
     if cfg.use_diffusion:
         NUM_PATCHES += 1
+    
 
     # Instantiate optimizer
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
