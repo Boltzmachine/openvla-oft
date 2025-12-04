@@ -2,7 +2,7 @@ import logging
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
-
+import torch.nn.functional as F
 import numpy as np
 import timm
 import math
@@ -48,66 +48,63 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
 
-    def forward(self, indices):
+    def forward(self, x):
         """
-        indices - [B, L]
+        indices - [B, L, ...]
         """
-        B, L = indices.size()
-        indices = indices.view(-1)
+        B, L = x.size()[:2]
+        indices = torch.arange(L, device=x.device)
         pe = self.pe[indices]
-        pe = pe.view(B, L, -1)
-        return pe
+        pe = pe.unsqueeze(1)
+        return x + pe
     
+from .tinglin_transformer import Attention, CrossAttention, MLP
 
-class CrossAttentionLayer(nn.Module):
-    def __init__(self, d_model: int, nheads: int = 8):
+
+class GateFusion(nn.Module):
+    def __init__(self, d_model: int):
         super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, nheads, batch_first=True)
-
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-
-        self.ff = nn.Sequential(
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
             nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model)
+            nn.Sigmoid(),
         )
-
-    def forward(self, q, k, v, attention_mask):
-        if attention_mask is not None:
-            raise NotImplementedError("CrossAttentionLayer does not support attention_mask yet.")
-        out = q + self.attn(q, k, v, key_padding_mask=attention_mask)[0]
-        out = self.ff(self.norm1(out)) + out
-        return out
+        
+    def forward(self, Hx, x):
+        """
+        Hx, x: (B, L, D)
+        """
+        g = self.gate(torch.cat([Hx, x], dim=-1))  # (B, L, D)
+        return g * Hx + (1 - g) * x
     
-class CrossAttention(nn.Module):
-    def __init__(self, d_model: int, nheads: int = 8, num_layers: int = 2):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            CrossAttentionLayer(d_model, nheads) for _ in range(num_layers)
-        ])
-
-    def forward(self, q, k, v, attention_mask):
-        for layer in self.layers:
-            q = layer(q, k, v, attention_mask)
-        return q
-
 
 class MemoryVLAForActionPrediction(OpenVLAForActionPrediction):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
     def patch_compressor(self):
-        self.per_token_compressor = nn.Sequential(
+        per_compressed_dim = 128
+        cog_compressed_dim = 1024
+        self.nolora_per_token_compressor = nn.Sequential(
             nn.Linear(4096, 1024),
             nn.ReLU(),
-            nn.Linear(1024, 128),
+            nn.Linear(1024, per_compressed_dim),
         )
-        self.cog_token_compressor = nn.Sequential(
-            nn.Linear(4096, 1024),
+        self.nolora_cog_token_compressor = nn.Sequential(
+            nn.Linear(4096, 2048),
             nn.ReLU(),
-            nn.Linear(1024, 128),
+            nn.Linear(2048, cog_compressed_dim),
         )
+        self.nolora_per_positional_encoding = PositionalEncoding(d_model=per_compressed_dim, max_len=5000)
+        self.nolora_cog_positional_encoding = PositionalEncoding(d_model=cog_compressed_dim, max_len=5000)
+        
+        self.nolora_per_gate_fusion = GateFusion(d_model=per_compressed_dim)
+        self.nolora_cog_gate_fusion = GateFusion(d_model=cog_compressed_dim)
+        
+        self.nolora_post_cog_attention = Attention(d_model=cog_compressed_dim, n_heads=8)
+        self.nolora_cog_per_attention = CrossAttention(d_model=cog_compressed_dim, d_model_q=cog_compressed_dim, d_model_kv=per_compressed_dim, n_heads=8)
+        self.nolora_ffn = MLP(in_features=cog_compressed_dim, hidden_features=4096, out_features=4096)
 
     # === Core Prismatic VLM `forward()` Logic ===
     def forward(
@@ -196,18 +193,12 @@ class MemoryVLAForActionPrediction(OpenVLAForActionPrediction):
             language_embeddings = input_embeddings[~all_actions_mask].reshape(
                 input_embeddings.shape[0], -1, input_embeddings.shape[2]
             )  # (B, lang_seq_len, llm_dim)
-            if other_pixel_values is not None and getattr(self.config, "invswap_ratio", 1.0) < 1.0:
-                assert not use_film
-                # selected_future_index = torch.randint(0, other_pixel_values.size(1), (1,)).item()
-                other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film, use_disentangle=True)
-                if isinstance(other_image_features, tuple):
-                    other_static, other_dynamic = other_image_features
             
             # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=getattr(self.config, "static_ratio", 0.0) > 0.0) # (B, num_images * num_patches, dim)
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=False)
             projected_patch_embeddings = projected_patch_embeddings.view(pixel_values.size(0) * self.vision_backbone.num_images_in_input, -1, projected_patch_embeddings.size(-1)) # (B, num_images, num_patches, dim)
             assert proprio is None
-
+            
             assert not isinstance(projected_patch_embeddings, tuple)
             # projected_patch_embeddings = torch.cat([other_image_features, projected_patch_embeddings], dim=1) if other_pixel_values is not None else projected_patch_embeddings # for memory
             # Add proprioceptive state if provided
@@ -272,34 +263,42 @@ class MemoryVLAForActionPrediction(OpenVLAForActionPrediction):
             # gather all action tokens
             action_token_indices = torch.nonzero(all_actions_mask.squeeze(-1), as_tuple=False)  # (num_action_tokens, 2)
             cog_tokens = last_hidden_states[action_token_indices[:,0], action_token_indices[:,1], :].view(last_hidden_states.size(0), -1, last_hidden_states.size(-1)) # (B * N, 56, D)
-            cog_tokens = self.cog_token_compressor(cog_tokens)  # (B * N, 56, 128)
-            per_tokens = self.per_token_compressor(projected_patch_embeddings)  # (B * N, num_patches, 128)
-
-
+            cog_tokens = self.nolora_cog_token_compressor(cog_tokens).view(input_ids.size(0), self.vision_backbone.num_images_in_input, 56, -1)  # (B, N, 56, 128)
+            per_tokens = self.nolora_per_token_compressor(projected_patch_embeddings).view(input_ids.size(0), self.vision_backbone.num_images_in_input, 256, -1)  # (B, N, num_patches, 128)
             
-            multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
-                input_embeddings, projected_patch_embeddings, attention_mask
-            )
-
-            # Build labels for multimodal sequence if needed
-            multimodal_labels = self._build_multimodal_labels(labels, projected_patch_embeddings)
-            action_token_mask = torch.cat([all_actions_mask[:, :1], torch.zeros(projected_patch_embeddings.size(0), projected_patch_embeddings.size(1), 1, device=all_actions_mask.device, dtype=all_actions_mask.dtype), all_actions_mask[:, 1:]], dim=1)
-
-            # Dispatch to language model
-            language_model_output = self.language_model(
-                input_ids=None,
-                attention_mask=multimodal_attention_mask,
-                position_ids=None,
-                past_key_values=None,
-                inputs_embeds=multimodal_embeddings,
-                labels=multimodal_labels,
-                action_token_mask=action_token_mask,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-
+            curr_cog_tokens, past_cog_tokens = cog_tokens[:, -1:], cog_tokens[:, :-1].contiguous()  # (B, 1, 56, 128), (B, N-1, 56, 128)
+            curr_per_tokens, past_per_tokens = per_tokens[:, -1:], per_tokens[:, :-1].contiguous()  # (B, 1, num_patches, 128), (B, N-1, num_patches, 128)
+            
+            H_cog = F.scaled_dot_product_attention(
+                query=curr_cog_tokens.view(curr_cog_tokens.size(0), -1, curr_cog_tokens.size(-1)),
+                key=self.nolora_cog_positional_encoding(past_cog_tokens).view(past_cog_tokens.size(0), -1, past_cog_tokens.size(-1)),
+                value=past_cog_tokens.view(past_cog_tokens.size(0), -1, past_cog_tokens.size(-1)),
+            ) # (B, 1 * 56, 128)
+            H_per = F.scaled_dot_product_attention(
+                query=curr_per_tokens.view(curr_per_tokens.size(0), -1, curr_per_tokens.size(-1)),
+                key=self.nolora_per_positional_encoding(past_per_tokens).view(past_per_tokens.size(0), -1, past_per_tokens.size(-1)),
+                value=past_per_tokens.view(past_per_tokens.size(0), -1, past_per_tokens.size(-1)),
+            ) # (B, 1 * num_patches, 128)
+            cog_tokens = self.nolora_cog_gate_fusion(H_cog.view_as(curr_cog_tokens), curr_cog_tokens).squeeze(1) # (B, 56, 128)
+            per_tokens = self.nolora_per_gate_fusion(H_per.view_as(curr_per_tokens), curr_per_tokens).squeeze(1) # (B, num_patches, 128)
+            
+            cog_tokens = self.nolora_post_cog_attention(cog_tokens) + cog_tokens
+            cog_tokens = self.nolora_cog_per_attention(cog_tokens, per_tokens, per_tokens) + cog_tokens
+            cog_tokens = self.nolora_ffn(cog_tokens)
+            
+            def fix_hidden_states(hidden_states):
+                hidden_states = hidden_states.view(input_ids.size(0), self.vision_backbone.num_images_in_input, -1, hidden_states.size(-1))
+                hidden_states = hidden_states[:, -1].contiguous()
+                return hidden_states
+            
+            language_model_output.logits = language_model_output.logits.view(input_ids.size(0), self.vision_backbone.num_images_in_input, -1, language_model_output.logits.size(-1))[:, -1].contiguous()
+            multimodal_labels = self._build_multimodal_labels(labels, projected_patch_embeddings.view(input_ids.size(0), self.vision_backbone.num_images_in_input, -1, projected_patch_embeddings.size(-1))[:, -1])
+            
+            loss = self.loss_function(logits=language_model_output.logits, labels=multimodal_labels, vocab_size=self.language_model.config.vocab_size)
+            language_model_output.loss = loss
+            language_model_output.hidden_states = tuple(fix_hidden_states(h) for h in language_model_output.hidden_states)
+            language_model_output.past_key_values = None
+            
         # === Otherwise =>> Assume Invalid! ===
         elif (input_ids.shape[0] != pixel_values.shape[0]) or (inputs_embeds.shape[0] != pixel_values.shape[0]):
             raise ValueError("Non-homogenous batch of (text, image) input -- forward() does not support mixed batches!")

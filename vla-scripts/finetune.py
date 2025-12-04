@@ -989,6 +989,19 @@ def finetune(cfg: FinetuneConfig) -> None:
             modules_to_save = []
             if cfg.disentangle:
                 modules_to_save += ["action_predictor", "disentangle_adapter", "attn_pooler"]
+                
+            if cfg.baseline == "memoryvla":
+                modules_to_save += [
+                    "nolora_per_token_compressor",
+                    "nolora_cog_token_compressor",
+                    "nolora_per_positional_encoding",
+                    "nolora_cog_positional_encoding",
+                    "nolora_per_gate_fusion",
+                    "nolora_cog_gate_fusion",
+                    "nolora_post_cog_attention",
+                    "nolora_cog_per_attention",
+                    "nolora_ffn",
+                ]
 
             lora_config = LoraConfig(
                 r=cfg.lora_rank,
@@ -1077,6 +1090,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         NUM_PATCHES = num_dynamic_patches * vla.module.vision_backbone.get_num_images_in_input() + num_static_patches
     elif cfg.baseline == "contextvla":
         NUM_PATCHES = vla.module.vision_backbone.get_num_patches() + 1
+    elif cfg.baseline == "memoryvla":
+        NUM_PATCHES = vla.module.vision_backbone.get_num_patches()
     else:
         raise NotImplementedError
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
