@@ -9,11 +9,12 @@ import json
 import logging
 import os
 import sys
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
+from libero.libero.envs.predicates import eval_predicate_fn
 
 import draccus
 import numpy as np
@@ -60,6 +61,7 @@ class TaskSuite(str, Enum):
     LIBERO_10 = "libero_10"
     LIBERO_90 = "libero_90"
     LIBERO_MEMORY = "libero_memory"
+    LIBERO_STOVE = "libero_stove"
 
 
 # Define max steps for each task suite
@@ -70,6 +72,7 @@ TASK_MAX_STEPS = {
     TaskSuite.LIBERO_10: 520,  # longest training demo has 505 steps
     TaskSuite.LIBERO_90: 400,  # longest training demo has 373 steps
     TaskSuite.LIBERO_MEMORY: 512,  # longest training demo has 512 steps
+    TaskSuite.LIBERO_STOVE: 600,  # longest training demo has 600 steps
 }
 
 
@@ -90,6 +93,7 @@ class GenerateConfig:
     # Model-specific parameters
     #################################################################################################################
     model_family: str = "openvla"                    # Model family
+    baseline: str = "none"                           # Baseline type (if applicable)
     pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
 
     use_l1_regression: bool = True                   # If True, uses continuous action head with L1 regression objective
@@ -303,7 +307,7 @@ def run_episode(
 ):
     """Run a single episode in the environment."""
     # Reset environment
-    if "memory" in cfg.task_suite_name:
+    if "memory" in cfg.task_suite_name or "stove" in cfg.task_suite_name:
         retry = 0
         while True:
             try:
@@ -364,6 +368,10 @@ def run_episode(
         else:
             return t < num_steps_wait
     
+    if "stove" in cfg.task_suite_name:
+        cook_count = 0
+        ever_moved = False
+        
     while t < max_steps:
         # Do nothing for the first few timesteps to let objects stabilize
         if need_wait(cfg.task_suite_name, env, t, cfg.num_steps_wait):
@@ -371,6 +379,7 @@ def run_episode(
             observation, img = prepare_observation(obs, resize_size)
             replay_images.append(img)
             replay_observations.append(deepcopy(observation))
+            t += 1
             continue
         # Prepare observation
         observation, img = prepare_observation(obs, resize_size)
@@ -411,6 +420,16 @@ def run_episode(
         
         # Execute action in environment
         obs, reward, done, info = env.step(action.tolist())
+
+        if "stove" in cfg.task_suite_name:
+            stove = env.env.object_states_dict['flat_stove_1_cook_region']
+            object_state = env.env.object_states_dict[env.env.first_cook_object]
+            if eval_predicate_fn("on", object_state, stove):
+                cook_count += 1
+                
+            if not eval_predicate_fn("closexy", object_state):
+                ever_moved = True
+
         if done:
             success = True
             break
@@ -419,7 +438,30 @@ def run_episode(
     # except Exception as e:
     #     log_message(f"Episode error: {e}", log_file)
 
+    if 'stove' in cfg.task_suite_name:
+        breakdown = {
+            "cook_count": min(abs(cook_count - 28), 40)
+        }
+        goal_state = env.env.parsed_problem["goal_state"]
+        for state in goal_state:
+            if state[0] == 'closexy':
+                breakdown[state[0]] = env.env._eval_predicate(state) and ever_moved
+            else:
+                breakdown[state[0]] = env.env._eval_predicate(state)
+
+        return success, replay_images, t, breakdown
     return success, replay_images, t
+
+
+def maybe_print_breakdown(cfg, breakdown, total_episodes, log_file, prestr):
+    """Print breakdown results if applicable."""
+    if "stove" in cfg.task_suite_name:
+        for key in breakdown:
+            if key == "cook_count":
+                avg = np.mean([v for v in breakdown[key] if v > 0]) if len([v for v in breakdown[key] if v > 0]) > 0 else 0
+            else:
+                avg = np.mean(breakdown[key]) if len(breakdown[key]) > 0 else 0
+            log_message(f"Overall {prestr} breakdown {key}: {avg}", log_file)
 
 
 def run_task(
@@ -434,6 +476,7 @@ def run_task(
     noisy_action_projector=None,
     total_episodes=0,
     total_successes=0,
+    total_breakdown=0,
     log_file=None,
 ):
     """Run evaluation for a single task."""
@@ -444,7 +487,7 @@ def run_task(
     try:
         initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
     except:
-        assert "memory" in cfg.task_suite_name, "Only libero_memory tasks can fail to load initial states!"
+        assert "memory" in cfg.task_suite_name or "stove" in cfg.task_suite_name, "Only libero_memory and libero_stove tasks can fail to load initial states!"
         initial_states, all_initial_states = None, None
 
     # Initialize environment and get task description
@@ -452,6 +495,8 @@ def run_task(
 
     # Start episodes
     task_episodes, task_successes = 0, 0
+    if "stove" in cfg.task_suite_name:
+        task_breakdown = defaultdict(list)
     for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
         log_message(f"\nTask: {task_description}", log_file)
         if initial_states is None:
@@ -477,7 +522,7 @@ def run_task(
         log_message(f"Starting episode {task_episodes + 1}...", log_file)
 
         # Run episode
-        success, replay_images, total_steps = run_episode(
+        success, replay_images, total_steps, *info = run_episode(
             cfg,
             env,
             task_description,
@@ -499,6 +544,12 @@ def run_task(
             task_successes += 1
             total_successes += 1
 
+        if len(info) > 0:
+            breakdown = info[0]
+            for key in breakdown:
+                task_breakdown[key].append(breakdown[key])
+                total_breakdown[key].append(breakdown[key])
+
         # Save replay video
         save_rollout_video(
             replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
@@ -508,6 +559,9 @@ def run_task(
         log_message(f"Success: {success}", log_file)
         log_message(f"Total steps: {total_steps}", log_file)
         log_message(f"# episodes completed so far: {total_episodes}", log_file)
+        if "stove" in cfg.task_suite_name:
+            for key in breakdown:
+                log_message(f"{key}: {breakdown[key]}", log_file)
         log_message(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)", log_file)
 
     # Log task results
@@ -516,15 +570,19 @@ def run_task(
 
     log_message(f"Current task success rate: {task_success_rate}", log_file)
     log_message(f"Current total success rate: {total_success_rate}", log_file)
+    maybe_print_breakdown(cfg, task_breakdown, task_episodes, log_file, "current")
+    maybe_print_breakdown(cfg, total_breakdown, total_episodes, log_file, "total")
+    if "stove" in cfg.task_suite_name:
+        return total_episodes, total_successes, total_breakdown
 
-    # Log to wandb if enabled
-    if cfg.use_wandb:
-        wandb.log(
-            {
-                f"success_rate/{task_description}": task_success_rate,
-                f"num_episodes/{task_description}": task_episodes,
-            }
-        )
+    # # Log to wandb if enabled
+    # if cfg.use_wandb:
+    #     wandb.log(
+    #         {
+    #             f"success_rate/{task_description}": task_success_rate,
+    #             f"num_episodes/{task_description}": task_episodes,
+    #         }
+    #     )
 
     return total_episodes, total_successes
 
@@ -556,9 +614,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
 
     # Start evaluation
-    total_episodes, total_successes = 0, 0
+    total_episodes, total_successes, total_breakdown = 0, 0, defaultdict(list)
     for task_id in tqdm.tqdm(range(num_tasks)):
-        total_episodes, total_successes = run_task(
+        total_episodes, total_successes, *total_breakdown = run_task(
             cfg,
             task_suite,
             task_id,
@@ -570,9 +628,11 @@ def eval_libero(cfg: GenerateConfig) -> float:
             noisy_action_projector,
             total_episodes,
             total_successes,
+            total_breakdown,
             log_file,
         )
-
+        if len(total_breakdown) > 0:
+            total_breakdown = total_breakdown[0]
     # Calculate final success rate
     final_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0
 
@@ -581,6 +641,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Total episodes: {total_episodes}", log_file)
     log_message(f"Total successes: {total_successes}", log_file)
     log_message(f"Overall success rate: {final_success_rate:.4f} ({final_success_rate * 100:.1f}%)", log_file)
+    maybe_print_breakdown(cfg, total_breakdown, total_episodes, log_file, "final")
     
     results_file.write(f"{cfg.pretrained_checkpoint}\t{final_success_rate:.4f}\n")
     results_file.close()

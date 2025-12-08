@@ -250,6 +250,33 @@ def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
     return new_state_dict
 
 
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.modeling_memoryvla import MemoryVLAForActionPrediction
+from prismatic.extern.hf.modeling_contextvla import ContextVLAForActionPrediction
+def initialize_vla(cfg):
+    if cfg.baseline == "memoryvla":
+        model_class = MemoryVLAForActionPrediction
+    elif cfg.baseline == "contextvla":
+        model_class = ContextVLAForActionPrediction
+    elif cfg.baseline == "none":
+        model_class = OpenVLAForActionPrediction
+    else:
+        raise ValueError(f"Unknown baseline: {cfg.baseline}")
+    
+    vla = model_class.from_pretrained(
+        cfg.pretrained_checkpoint,
+        # attn_implementation="flash_attention_2",
+        torch_dtype=torch.bfloat16,
+        load_in_8bit=cfg.load_in_8bit,
+        load_in_4bit=cfg.load_in_4bit,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    )
+    if cfg.baseline == "memoryvla":
+        vla.patch_compressor()
+    return vla
+        
+
 def get_vla(cfg: Any) -> torch.nn.Module:
     """
     Load and initialize the VLA model from checkpoint.
@@ -279,15 +306,7 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         check_model_logic_mismatch(cfg.pretrained_checkpoint)
 
     # Load the model
-    vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.pretrained_checkpoint,
-        # attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
-        load_in_8bit=cfg.load_in_8bit,
-        load_in_4bit=cfg.load_in_4bit,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
+    vla = initialize_vla(cfg)
 
     # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
     if cfg.use_film:
