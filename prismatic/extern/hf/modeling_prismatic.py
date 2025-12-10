@@ -22,7 +22,7 @@ from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 import random
 from vla_modules import DisentangleAdapter, ActionPredictor, AttentionPooling
-
+from torchvision.models.feature_extraction import get_graph_node_names, create_feature_extractor
 from prismatic.training.train_utils import (
     get_current_action_mask,
     get_next_actions_mask,
@@ -255,6 +255,22 @@ class PrismaticVisionBackbone(nn.Module):
 
             # Split `pixel_values :: [bsz, 2 * 3, resolution, resolution]` =>> featurize =>> channel stack
             img, img_fused = torch.split(pixel_values, [3, 3], dim=1)
+            if kwargs.get("output_attentions", False):
+                from prismatic.extern.hf.visualization_utils import show_mask_on_image, show, visualize_attention
+
+                return_nodes = [f'blocks.{i}.attn.softmax' for i in range(len(self.featurizer.blocks))]
+                _featurizer = create_feature_extractor(self.featurizer, return_nodes=return_nodes)
+                attentions = []
+                out = _featurizer(img)
+
+                for return_node in return_nodes:
+                    attentions.append(out[return_node][:, :, self.featurizer.num_prefix_tokens:, self.featurizer.num_prefix_tokens:]) #(B, num_heads, N, N)
+                attentions = torch.stack(attentions, dim=0).detach() #(L, B, num_heads, N, N)
+                attentions = attentions[-3:-1]
+
+                visualize_attention(pixel_values, attentions, discard_ratio=0.9, head_fusion='max', n_static_tokens=kwargs['n_static_tokens'], self_loop=False)
+                import ipdb; ipdb.set_trace()
+
             if 'n_inject' in kwargs:
                 patches, patches_fused = self.featurizer(img, n_inject=kwargs['n_inject'], injected_embeddings=kwargs['injected_embeddings'][0]), self.fused_featurizer(img_fused, n_inject=kwargs['n_inject'], injected_embeddings=kwargs['injected_embeddings'][1])
             else:
@@ -529,17 +545,17 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         all_actions_mask = current_action_mask | next_actions_mask  # (B, seq_len)
         return all_actions_mask
 
-    def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False, use_disentangle=False):
+    def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False, use_disentangle=False, output_attentions=False):
         """Process vision features with optional FiLM conditioning"""
         if self.config.disentangle_method == "inject":
             kwargs = { 'n_inject': 12, 'injected_embeddings': self.disentangle_adapter(None, device=pixel_values.device) }
         else:
-            kwargs = {}
+            kwargs = {'n_static_tokens': self.n_static_tokens} if output_attentions else {}
         if use_film:
             # FiLM: Infuse language inputs into visual features
-            patch_features = self.vision_backbone(pixel_values, language_embeddings, **kwargs)  # (bsz, 256 * num_images, D)
+            patch_features = self.vision_backbone(pixel_values, language_embeddings, output_attentions=output_attentions, **kwargs)  # (bsz, 256 * num_images, D)
         else:
-            patch_features = self.vision_backbone(pixel_values, **kwargs)  # (bsz, 256 * num_images, D)
+            patch_features = self.vision_backbone(pixel_values, output_attentions=output_attentions, **kwargs)  # (bsz, 256 * num_images, D)
         # Project patch embeddings into language embedding space
         patch_features = self.projector(patch_features)
 
@@ -700,9 +716,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film, use_disentangle=True)
                 if isinstance(other_image_features, tuple):
                     other_static, other_dynamic = other_image_features
-            
+
             # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=other_pixel_values is not None)
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=other_pixel_values is not None, output_attentions=False)
             if isinstance(projected_patch_embeddings, tuple):
                 static, dynamic = projected_patch_embeddings
                 if other_pixel_values is not None:
@@ -1229,7 +1245,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=kwargs.get("other_pixel_values", None) is not None)
+        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=kwargs.get("other_pixel_values", None) is not None, output_attentions=True)
         if isinstance(projected_patch_embeddings, tuple):
             static, dynamic = projected_patch_embeddings
         
