@@ -446,6 +446,7 @@ def run_episode(
         for state in goal_state:
             if state[0] == 'closexy':
                 breakdown[state[0]] = env.env._eval_predicate(state) and ever_moved
+                success = success and breakdown[state[0]]
             else:
                 breakdown[state[0]] = env.env._eval_predicate(state)
 
