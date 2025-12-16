@@ -239,6 +239,24 @@ class PrismaticVisionBackbone(nn.Module):
         """
         self.num_images_in_input = num_images_in_input
 
+    def prepare_visualization(self):
+        from collections import defaultdict
+        self.vis_buffer = defaultdict(list)
+
+    def finalize_visualization(self):
+        # make videos
+        import imageio
+        import os
+        for key, images in self.vis_buffer.items():
+            height, width, _ = images[0].shape
+            video_path = f"visualizations/{key}.mp4"
+            os.makedirs(os.path.dirname(video_path), exist_ok=True)
+            video_writer = imageio.get_writer(video_path, fps=10)
+            for img in images:
+                video_writer.append_data(img[:, :, ::-1])  # RGB to BGR
+            video_writer.close()
+        exit()
+
     def forward(self, pixel_values: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Implements the forward pass for the vision backbone.
@@ -266,10 +284,9 @@ class PrismaticVisionBackbone(nn.Module):
                 for return_node in return_nodes:
                     attentions.append(out[return_node][:, :, self.featurizer.num_prefix_tokens:, self.featurizer.num_prefix_tokens:]) #(B, num_heads, N, N)
                 attentions = torch.stack(attentions, dim=0).detach() #(L, B, num_heads, N, N)
-                attentions = attentions[-3:-1]
+                attentions = attentions[-4:-3]
 
-                visualize_attention(pixel_values, attentions, discard_ratio=0.9, head_fusion='max', n_static_tokens=kwargs['n_static_tokens'], self_loop=False)
-                import ipdb; ipdb.set_trace()
+                visualize_attention(self.vis_buffer, pixel_values, attentions, discard_ratio=0.9, head_fusion='max', n_static_tokens=kwargs['n_static_tokens'], self_loop=False)
 
             if 'n_inject' in kwargs:
                 patches, patches_fused = self.featurizer(img, n_inject=kwargs['n_inject'], injected_embeddings=kwargs['injected_embeddings'][0]), self.fused_featurizer(img_fused, n_inject=kwargs['n_inject'], injected_embeddings=kwargs['injected_embeddings'][1])
@@ -468,6 +485,12 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
 
         return self
+    
+    def prepare_visualization(self):
+        self.vision_backbone.prepare_visualization()
+    
+    def finalize_visualization(self):
+        self.vision_backbone.finalize_visualization()
     
     # === `PreTrainedModel` Boilerplate ===
     def get_input_embeddings(self) -> nn.Module:

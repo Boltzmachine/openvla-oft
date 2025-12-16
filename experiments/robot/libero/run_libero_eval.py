@@ -325,6 +325,7 @@ def run_episode(
     # Run episode
     cache = None
     success = False
+    model.prepare_visualization()
     while t < max_steps + cfg.num_steps_wait:
         # Do nothing for the first few timesteps to let objects stabilize
         if t < cfg.num_steps_wait:
@@ -376,7 +377,7 @@ def run_episode(
 
     # except Exception as e:
     #     log_message(f"Episode error: {e}", log_file)
-
+    model.finalize_visualization()
     return success, replay_images
 
 

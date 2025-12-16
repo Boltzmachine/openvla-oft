@@ -109,7 +109,16 @@ def show(imgs):
     plt.savefig("images.png", dpi=300, bbox_inches='tight')
 
 
-def visualize_attention(pixel_values, attentions, discard_ratio, head_fusion, n_static_tokens, self_loop=True):
+
+def write_to(name, img, buffer=None):
+    if buffer is None:
+        path = f"visualizations/{name}"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        cv2.imwrite(path + '.png', img)
+    else:
+        buffer[name].append(img)
+
+def visualize_attention(vis_buffer, pixel_values, attentions, discard_ratio, head_fusion, n_static_tokens, self_loop=True):
     vis_masks = rollout(attentions, discard_ratio=discard_ratio, head_fusion=head_fusion, self_loop=self_loop)
     for ind, (img, vis_mask) in enumerate(zip(pixel_values[:, :3], vis_masks)):
         pil_img = torchvision.transforms.functional.to_pil_image(img.float() * img.new_tensor([0.228515625, 0.2236328125, 0.224609375]).view(3, 1, 1) + img.new_tensor([0.484375, 0.455078125, 0.40625]).view(3, 1, 1))
@@ -117,8 +126,7 @@ def visualize_attention(pixel_values, attentions, discard_ratio, head_fusion, n_
         for n_token in range(vis_mask.shape[0]):
             token_mask = cv2.resize(vis_mask[n_token], (np_img.shape[1], np_img.shape[0]))
             token_mask_img = show_mask_on_image(np_img, token_mask)
-            os.makedirs(f"visualizations/{ind}/tokens", exist_ok=True)
-            cv2.imwrite(f"visualizations/{ind}/tokens/token_{n_token}.png", token_mask_img)
+            write_to(f"{ind}/tokens/token_{n_token}", token_mask_img, vis_buffer)
 
         static_mask = cv2.resize(vis_mask[:n_static_tokens].mean(0), (np_img.shape[1], np_img.shape[0]))
         dynamic_mask = cv2.resize(vis_mask[n_static_tokens:].mean(0), (np_img.shape[1], np_img.shape[0]))
@@ -126,7 +134,6 @@ def visualize_attention(pixel_values, attentions, discard_ratio, head_fusion, n_
         dynamic_mask = show_mask_on_image(np_img, dynamic_mask)
 
         img_name = "none"
-        os.makedirs(f"visualizations/{ind}", exist_ok=True)
-        cv2.imwrite(f"visualizations/{ind}/input.png", np_img)
-        cv2.imwrite(f"visualizations/{ind}/{img_name}_static.png", static_mask)
-        cv2.imwrite(f"visualizations/{ind}/{img_name}_dynamic.png", dynamic_mask)
+        write_to(f"{ind}/input", np_img, vis_buffer)
+        write_to(f"{ind}/{img_name}_static", static_mask, vis_buffer)
+        write_to(f"{ind}/{img_name}_dynamic", dynamic_mask, vis_buffer)
