@@ -267,21 +267,27 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     # actually go into effect
     # If loading a pretrained checkpoint from Hugging Face Hub, we just assume that the policy
     # will be used as is, with its original modeling logic
-    if not model_is_on_hf_hub(cfg.pretrained_checkpoint):
-        # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
-        AutoConfig.register("openvla", OpenVLAConfig)
-        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+    # if not model_is_on_hf_hub(cfg.pretrained_checkpoint):
+    #     # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
+    #     AutoConfig.register("openvla", OpenVLAConfig)
+    #     AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+    #     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+    #     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-        # Update config.json and sync model files
-        update_auto_map(cfg.pretrained_checkpoint)
-        check_model_logic_mismatch(cfg.pretrained_checkpoint)
+    #     # Update config.json and sync model files
+    #     update_auto_map(cfg.pretrained_checkpoint)
+    #     check_model_logic_mismatch(cfg.pretrained_checkpoint)
 
+    if cfg.baseline != 'none':
+        config = OpenVLAConfig.from_pretrained(cfg.pretrained_checkpoint)
+        config.baseline = cfg.baseline
+    else:
+        config = None
     # Load the model
-    vla = AutoModelForVision2Seq.from_pretrained(
+    vla = OpenVLAForActionPrediction.from_pretrained(
         cfg.pretrained_checkpoint,
         # attn_implementation="flash_attention_2",
+        config=config,
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
@@ -784,6 +790,32 @@ def get_vla_action(
             proprio_norm_stats = vla.norm_stats[cfg.unnorm_key]["proprio"]
             obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
             proprio = obs["state"]
+            
+        if 'vlacache' in cfg.baseline:
+            from vla_modules.utils import format_image, find_static_patches, task_relevant_selection, get_layer_mask_schedule
+            vla.language_model.config.proportion_attn_var = None
+            use_vla_cache = True
+            if use_vla_cache:
+                prompt_cache = cache['past_key_values'] if cache is not None else None
+                prev_attn = cache['attentions'] if cache is not None else None
+                curr_image = format_image(None, inputs['pixel_values'][0,:3,:,:].float().cpu().numpy())
+                import ipdb; ipdb.set_trace()
+                # Step 1: Identify visually stable patches across frames
+                if prompt_cache is not None:
+                    prev_image = format_image(None, inputs['other_pixel_values'][0,:3,:,:].float().cpu().numpy())
+                    stable_patches = find_static_patches(curr_image, prev_image, top_k=130)
+
+                # Step 2: Use prior attention to filter out task-relevant tokens
+                if prev_attn is not None:
+                    result_image, remaining_static_tokens_indices = task_relevant_selection(
+                        prev_attn, curr_image, stable_patches
+                    )
+
+                    # Step 3: Merge remaining static token indices and update model config
+                    mask_indices = torch.tensor(remaining_static_tokens_indices).cuda() if remaining_static_tokens_indices else None
+
+                    vla.language_model.config.reusable_patches = mask_indices
+                    vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
 
         # Generate action
         if action_head is None:

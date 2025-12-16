@@ -87,6 +87,7 @@ class GenerateConfig:
     # Model-specific parameters
     #################################################################################################################
     model_family: str = "openvla"                    # Model family
+    baseline: str = "none"                           # Baseline type ('none', 'lora', 'adapter', etc.)
     pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
 
     use_l1_regression: bool = True                   # If True, uses continuous action head with L1 regression objective
@@ -319,7 +320,7 @@ def run_episode(
     replay_images = []
     replay_observations = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
-    max_cache_steps = 2 if model.config.static_ratio > 0 else 0
+    max_cache_steps = 2 if (model.config.static_ratio > 0) or cfg.baseline == "vlacache" else 0
     cache_steps = 0
 
     # Run episode
@@ -352,7 +353,7 @@ def run_episode(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 use_film=cfg.use_film,
-                history_image=None, #history_image,
+                history_image=history_image if cfg.baseline == "vlacache" else None,
                 cache=cache,
             )
             action_queue.extend(actions)

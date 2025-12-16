@@ -409,10 +409,27 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             llm_dim=config.text_config.hidden_size,
         )
 
-        # Instantiate LLM Backbone
-        self.language_model = AutoModelForCausalLM.from_config(
-            config.text_config, attn_implementation=config._attn_implementation
-        )
+        if getattr(config, "baseline", "none") == "effvla":
+            # Instantiate LLM Backbone
+            from prismatic.extern.hf.modeling_llama_effvla import LlamaForCausalLMEffVLA
+            self.language_model = LlamaForCausalLMEffVLA._from_config(
+                config.text_config, attn_implementation=config._attn_implementation
+            )
+            self.language_model.model.skip_layers = [3, 5, 2, 4, 6, 7, 19, 20, 17, 23, 21, 18, 27, 8, 25, 9, 28, 16, 26, 24, 12, 13, 15, 14, 29, 30, 10, 11, 22, 1, 31, 0][:3]
+        elif getattr(config, "baseline", "none") == "vlacache":
+            # Instantiate LLM Backbone
+            from prismatic.extern.hf.modeling_llama_vlacache import LlamaForCausalLMVLACache
+            self.language_model = LlamaForCausalLMVLACache._from_config(
+                config.text_config, attn_implementation=config._attn_implementation
+            )
+        elif getattr(config, "baseline", "none") == "none":
+            # Instantiate LLM Backbone
+            self.language_model = AutoModelForCausalLM.from_config(
+                config.text_config, attn_implementation=config._attn_implementation
+            )
+        else:
+            raise ValueError(f"Unknown baseline: {config.baseline}")
+
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = config.pad_token_id
         self.llm_dim = config.text_config.hidden_size
@@ -1045,7 +1062,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             action_token_mask=action_token_mask,
             labels=None,
             use_cache=None,
-            output_attentions=False,
+            output_attentions=getattr(self.config, "baseline", "none") == "vlacache",
             output_hidden_states=True,
             return_dict=True,
         )
@@ -1157,7 +1174,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             #normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.reshape(-1, ACTION_DIM)
 
-        return normalized_actions, reponse_ids, language_model_output.past_key_values
+        return normalized_actions, reponse_ids, language_model_output
     
     def truncate_cache(
         self,
@@ -1282,7 +1299,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
         else:
             # Run regression or discrete token-based prediction
-            normalized_actions, actions_hidden_states, past_key_values = self._regression_or_discrete_prediction(
+            normalized_actions, actions_hidden_states, language_model_output = self._regression_or_discrete_prediction(
                 input_embeddings,
                 all_actions_mask,
                 projected_patch_embeddings,
@@ -1297,7 +1314,16 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Unnormalize predicted actions
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
 
-        return actions, actions_hidden_states, self.truncate_cache(past_key_values)
+        past_key_values = language_model_output.past_key_values
+        if getattr(self.config, "baseline", "none") == "effvla":
+            cache = None
+        elif getattr(self.config, "baseline", "none") == "vlacache":
+            cache = {"past_key_values": past_key_values, "attentions": language_model_output.attentions}
+        elif getattr(self.config, "baseline", "none") == "none":
+            cache = self.truncate_cache(past_key_values)
+        else:
+            raise ValueError("Unsupported baseline type for action prediction cache handling.")
+        return actions, actions_hidden_states, cache
 
     @staticmethod
     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:
