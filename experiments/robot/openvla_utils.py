@@ -792,30 +792,30 @@ def get_vla_action(
             proprio = obs["state"]
             
         if 'vlacache' in cfg.baseline:
-            from vla_modules.utils import format_image, find_static_patches, task_relevant_selection, get_layer_mask_schedule
+            from vla_modules.utils import find_static_patches, task_relevant_selection, get_layer_mask_schedule
+            # Process images
+            prompt_cache = cache['past_key_values'] if cache is not None else None
+            prev_attn = cache['attentions'] if cache is not None else None
+        
+            mask_indices = None
             vla.language_model.config.proportion_attn_var = None
-            use_vla_cache = True
-            if use_vla_cache:
-                prompt_cache = cache['past_key_values'] if cache is not None else None
-                prev_attn = cache['attentions'] if cache is not None else None
-                curr_image = format_image(None, inputs['pixel_values'][0,:3,:,:].float().cpu().numpy())
-                import ipdb; ipdb.set_trace()
-                # Step 1: Identify visually stable patches across frames
-                if prompt_cache is not None:
-                    prev_image = format_image(None, inputs['other_pixel_values'][0,:3,:,:].float().cpu().numpy())
-                    stable_patches = find_static_patches(curr_image, prev_image, top_k=130)
-
-                # Step 2: Use prior attention to filter out task-relevant tokens
-                if prev_attn is not None:
-                    result_image, remaining_static_tokens_indices = task_relevant_selection(
-                        prev_attn, curr_image, stable_patches
-                    )
-
-                    # Step 3: Merge remaining static token indices and update model config
-                    mask_indices = torch.tensor(remaining_static_tokens_indices).cuda() if remaining_static_tokens_indices else None
-
-                    vla.language_model.config.reusable_patches = mask_indices
-                    vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
+            # Step 1: Identify visually stable patches across frames
+            if prompt_cache is not None:
+                stable_patches_primary = find_static_patches(primary_image, history_image, top_k=150)
+    
+            # Step 2: Use prior attention to filter out task-relevant tokens
+            if prev_attn is not None:
+                vis_primary, remaining_static_tokens_primary = task_relevant_selection(
+                    prev_attn, primary_image, stable_patches_primary, primary=True
+                )
+    
+                # Step 3: Merge remaining static token indices and update model config
+                final_static_token_indices = remaining_static_tokens_primary# + remaining_static_tokens_wrist
+                mask_indices = torch.tensor(final_static_token_indices, device=DEVICE) if final_static_token_indices else None
+    
+                vla.language_model.config.reusable_patches = mask_indices
+                vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
+            cache = prompt_cache
 
         # Generate action
         if action_head is None:

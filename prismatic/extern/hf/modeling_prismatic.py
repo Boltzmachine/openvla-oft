@@ -1049,7 +1049,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
         action_token_mask = torch.cat([all_actions_mask[:, :1], torch.zeros(projected_patch_embeddings.size(0), projected_patch_embeddings.size(1), 1, device=all_actions_mask.device, dtype=all_actions_mask.dtype), all_actions_mask[:, 1:]], dim=1)
         # Forward pass through language model
-        if cache is not None:
+        if cache is not None and getattr(self.config, "baseline", "none") == "none":
             cache_length = cache[0][0].shape[2]
             multimodal_embeddings = multimodal_embeddings[:, cache_length:]
             action_token_mask = action_token_mask[:, cache_length:]
@@ -1067,7 +1067,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             return_dict=True,
         )
         
-        if cache is not None:
+        if cache is not None
             NUM_PROMPT_TOKENS = NUM_PROMPT_TOKENS - cache_length
 
         if action_head is not None:
@@ -1078,7 +1078,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
                 :,
             ]  # (B, act_chunk_len, D)
-
+            actions_hidden_states = last_hidden_states[:, -ACTION_DIM * NUM_ACTIONS_CHUNK-2:-2, :]
             # L1 regression prediction
             normalized_actions = action_head.predict_action(actions_hidden_states)
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
