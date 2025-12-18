@@ -66,6 +66,7 @@ from prismatic.vla.constants import (
 )
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+from vla_modules.utils import postset_model
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -858,16 +859,6 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
-    
-    
-def postset_model(vla, cfg):
-    if not hasattr(vla, "disentangle_adapter"):
-        vla.config.invswap_ratio = cfg.invswap_ratio
-        vla.config.static_ratio = cfg.static_ratio
-        vla.config.disentangle_method = cfg.disentangle
-        vla.config.use_cache_gate = cfg.use_cache_gate
-        vla.config.backward_window_size = cfg.backward_window_size
-        vla.patch_projector(cfg.static_ratio)
 
 def check_cfg(cfg):
     if cfg.resume:
@@ -928,8 +919,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     run_id, grp_name = get_run_id(cfg)
     if cfg.resume:
         run_id = possible_ref_cfg.run_id
-        if possible_ref_cfg.run_id_note is not None:
-            run_id += f"--{possible_ref_cfg.run_id_note}"
     cfg.run_id = run_id
     # Create experiment run directory
     run_dir = cfg.run_root_dir / run_id

@@ -38,7 +38,7 @@ from prismatic.vla.constants import (
 )
 
 from .configuration_prismatic import OpenVLAConfig, PrismaticConfig
-
+from vla_modules.utils import patch_projector
 # Set up logger
 logger = logging.getLogger(__name__)
 
@@ -419,7 +419,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.llm_dim = config.text_config.hidden_size
 
         if getattr(config, "disentangle_method", "none") != "none":
-            self.patch_projector(self.config.static_ratio)
+            patch_projector(self, self.config.static_ratio)
         else:
             self.config.disentangle_method = "none"
 
@@ -434,29 +434,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             assert self.vision_backbone.get_num_patches() == 256
             return int(self.vision_backbone.get_num_patches() * self.config.static_ratio)
         raise ValueError("Cannot determine number of static tokens!")
-        return None
                 
     def patch_projector(self, static_ratio):
-        if "none" not in self.config.disentangle_method:
-            if "extra" in self.config.disentangle_method:
-                self.config.backbone = "query_transformer"
-                self.config.quantizer = "none"
-                hidden_dim = 4096
-            elif 'inject' in self.config.disentangle_method:
-                self.config.backbone = "none"
-                self.config.quantizer = "none"
-                hidden_dim = 1024
-            else:
-                raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
-            self.disentangle_adapter = DisentangleAdapter(static_ratio=static_ratio, hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer).to(self.language_model.device)
-        if 'nce' in self.config.disentangle_method:
-            self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
-        
-        if self.config.use_cache_gate:
-            from vla_modules import CacheGate
-            self.cache_gate = CacheGate(4096).to(self.language_model.device)
-
-        return self
+        return patch_projector(self, static_ratio)
     
     # === `PreTrainedModel` Boilerplate ===
     def get_input_embeddings(self) -> nn.Module:
