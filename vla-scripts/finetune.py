@@ -81,6 +81,7 @@ class FinetuneConfig:
     static_ratio: float = 0.0
     invswap_ratio: float = 1.0
     use_contrastive: bool = False
+    use_cache_gate: bool = False
     backward_window_size: int = 10
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
@@ -194,6 +195,7 @@ def get_run_id(cfg) -> str:
         run_id += f"+swap-{cfg.invswap_ratio}"
         run_id += f"+dis-{cfg.disentangle}"
         run_id += f"+static-{cfg.static_ratio}"
+        run_id += f"+gate-{cfg.use_cache_gate}"
         run_id += f'+bw-{cfg.backward_window_size}'
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
@@ -304,7 +306,8 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
-    use_contrastive=False
+    use_contrastive=False,
+    use_cache_gate=False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -499,6 +502,11 @@ def run_forward_pass(
                 )
                 metrics['nce_loss'] = nce_loss.item()
                 loss = loss + 0.1 * nce_loss
+
+        if use_cache_gate:
+            choose_curr_penalty = output.choose_curr_penalty
+            metrics['choose_curr_penalty'] = choose_curr_penalty.detach()
+            loss = loss + 0.001 * choose_curr_penalty
             
         if 'commit_loss' in static:
             raise
@@ -808,6 +816,7 @@ def run_validation(
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 use_contrastive=cfg.use_contrastive,
+                use_cache_gate=cfg.use_cache_gate,
             )
 
             # Add the loss value to the metrics
@@ -856,6 +865,7 @@ def postset_model(vla, cfg):
         vla.config.invswap_ratio = cfg.invswap_ratio
         vla.config.static_ratio = cfg.static_ratio
         vla.config.disentangle_method = cfg.disentangle
+        vla.config.use_cache_gate = cfg.use_cache_gate
         vla.config.backward_window_size = cfg.backward_window_size
         vla.patch_projector(cfg.static_ratio)
 
@@ -997,7 +1007,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         else:
             modules_to_save = []
             if cfg.disentangle:
-                modules_to_save += ["action_predictor", "disentangle_adapter", "attn_pooler"]
+                modules_to_save += ["action_predictor", "disentangle_adapter", "attn_pooler", "cache_gate"]
 
             lora_config = LoraConfig(
                 r=cfg.lora_rank,
@@ -1236,6 +1246,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 use_contrastive=cfg.use_contrastive,
+                use_cache_gate=cfg.use_cache_gate,
             )
 
             # Normalize loss to account for gradient accumulation

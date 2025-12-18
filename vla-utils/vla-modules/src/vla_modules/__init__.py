@@ -3,6 +3,8 @@ from torch import nn
 from vit_pytorch.vit import Attention, FeedForward, Transformer2
 from vector_quantize_pytorch import VectorQuantize, FSQ
 from einops import rearrange
+from vla_modules.transformer_utils import TransformerBlock, Transformer
+import torch.nn.functional as F
 
 
 class QueryTransformer(nn.Module):
@@ -55,7 +57,43 @@ class AttentionPooling(nn.Module):
         x = torch.cat([self.cls_embedding.expand(x.shape[0], -1, -1), x], dim=1)
         x = self.attn(x)
         return x[:, 0, :]  # (B, dim)
-      
+
+
+def gumbel_softmax(logits, tau=1, hard=True):
+    logits = torch.log(logits.softmax(-1))
+    output = F.gumbel_softmax(logits, tau=tau, hard=hard)
+    return output
+
+class CacheGate(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        # self.dim_reducer = nn.Sequential(
+        #     nn.Linear(dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, dim),
+        # )
+        self.type_embedder = nn.Embedding(2, dim)
+        self.cls_embedding = nn.Parameter(torch.randn(1, 1, dim))
+        self.transformer = Transformer(
+            d_model=dim,
+            n_layers=2,
+            n_heads=8,
+        )
+        self.head = nn.Linear(dim, 2)
+
+    def forward(self, x_past, x_curr):
+        """
+        x_past - [B, N, d]
+        x_curr - [B, N, d]
+        """
+        types = torch.tensor([0] * x_past.shape[1] + [1] * x_curr.shape[1], device=x_past.device).unsqueeze(0)  # (1, 2N)
+        x_past_curr = torch.cat([x_past, x_curr], dim=1)  + self.type_embedder(types) # (B, 2N, D)
+        sequence = torch.cat([self.cls_embedding.expand(x_past_curr.shape[0], -1, -1), x_past_curr], dim=1) # (B, 2N+1, D)
+        sequence = self.transformer(sequence)
+        gate = self.head(sequence[:, 0, :])  # (B, dim)
+        gate = gumbel_softmax(gate, hard=True)
+        return gate
+
                 
 class DisentangleAdapter(nn.Module):
     def __init__(

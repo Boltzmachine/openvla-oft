@@ -336,6 +336,7 @@ class PrismaticCausalLMOutputWithPast(ModelOutput):
     # Additions for VLMs
     projector_features: Optional[torch.FloatTensor] = None
     static_features: Optional[Tuple[torch.FloatTensor]] = None
+    choose_curr_penalty: Optional[torch.FloatTensor] = None
 
 
 class PrismaticPreTrainedModel(PreTrainedModel):
@@ -450,6 +451,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             self.disentangle_adapter = DisentangleAdapter(static_ratio=static_ratio, hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer).to(self.language_model.device)
         if 'nce' in self.config.disentangle_method:
             self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
+        
+        if self.config.use_cache_gate:
+            from vla_modules import CacheGate
+            self.cache_gate = CacheGate(4096).to(self.language_model.device)
 
         return self
     
@@ -706,12 +711,22 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             if isinstance(projected_patch_embeddings, tuple):
                 static, dynamic = projected_patch_embeddings
                 if other_pixel_values is not None:
-                    if random.random() < self.config.invswap_ratio:
-                        projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+                    if self.config.use_cache_gate:
+                        gate = self.cache_gate(
+                            x_past=torch.cat([other_static['features'], other_dynamic], dim=1),
+                            x_curr=torch.cat([static['features'], dynamic], dim=1)
+                        )
+                        static_chosen = (gate[:, :, None, None] * torch.stack([other_static['features'], static['features']], dim=1)).sum(1)
+                        projected_patch_embeddings = torch.cat([static_chosen, dynamic], dim=1)
+                        choose_curr_penalty = gate[:, 1].mean()
                     else:
-                        projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
+                        if random.random() < self.config.invswap_ratio:
+                            projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+                        else:
+                            projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
                 else:
                     projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+
             if hasattr(self, 'attn_pooler'):
                 static['pooling'] = self.attn_pooler(static['features'])
                 other_static['pooling'] = self.attn_pooler(other_static['features'])
@@ -806,6 +821,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             attentions=language_model_output.attentions,
             projector_features=projected_patch_embeddings,
             static_features=(static, other_static) if "static" in locals() and "other_static" in locals() else None,
+            choose_curr_penalty=choose_curr_penalty if "choose_curr_penalty" in locals() else None,
         )
 
     # === GenerationMixin Methods ===
