@@ -84,6 +84,7 @@ class FinetuneConfig:
     use_contrastive: bool = False
     use_cache_gate: bool = False
     backward_window_size: int = 10
+    train_gate_only: bool = False
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
@@ -507,7 +508,7 @@ def run_forward_pass(
         if use_cache_gate:
             choose_curr_penalty = output.choose_curr_penalty
             metrics['choose_curr_penalty'] = choose_curr_penalty.detach()
-            loss = loss + 0.001 * choose_curr_penalty
+            loss = loss + 0.0006 * choose_curr_penalty
             
         if 'commit_loss' in static:
             raise
@@ -902,7 +903,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     """
     modeling_file = open("prismatic/extern/hf/modeling_prismatic.py").read()
     possible_ref_cfg = check_cfg(cfg)
-    assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
+    if not cfg.use_lora:
+        assert cfg.train_gate_only
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
@@ -919,6 +921,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     run_id, grp_name = get_run_id(cfg)
     if cfg.resume:
         run_id = possible_ref_cfg.run_id
+    if cfg.train_gate_only:
+        run_id = "gate-" + run_id
     cfg.run_id = run_id
     # Create experiment run directory
     run_dir = cfg.run_root_dir / run_id
@@ -988,7 +992,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
     # LoRA setup
-    if cfg.use_lora:
+    if cfg.use_lora and not cfg.train_gate_only:
         if cfg.resume:
             adapter_dir = Path(cfg.resume_dir) / "lora_adapter"
             postset_model(vla, cfg)
@@ -1013,8 +1017,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             vla = get_peft_model(vla, lora_config)
             vla.print_trainable_parameters()
     else:
-        vla.config.disentangle_method = cfg.disentangle
-        vla.patch_projector()
+        postset_model(vla, cfg)
         
 
     # FiLM setup
@@ -1092,19 +1095,26 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.use_diffusion:
         NUM_PATCHES += 1
 
-    # Instantiate optimizer
-    trainable_params = [param for param in vla.parameters() if param.requires_grad]
-    if cfg.use_l1_regression or cfg.use_diffusion:
-        trainable_params += [param for param in action_head.parameters() if param.requires_grad]
-    if cfg.use_diffusion:
-        trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
-    if cfg.use_proprio:
-        trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
-    print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
-    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
-    if cfg.resume:
-        optimizer_state_dict = load_checkpoint("optimizer", cfg.resume_dir, resume_step)
-        optimizer.load_state_dict(optimizer_state_dict)
+    if cfg.train_gate_only:
+        trainable_params = vla.module.cache_gate.parameters()
+        optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+        for name, param in vla.named_parameters():
+            if "cache_gate" not in name:
+                param.requires_grad = False
+    else:
+        # Instantiate optimizer
+        trainable_params = [param for param in vla.parameters() if param.requires_grad]
+        if cfg.use_l1_regression or cfg.use_diffusion:
+            trainable_params += [param for param in action_head.parameters() if param.requires_grad]
+        if cfg.use_diffusion:
+            trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
+        if cfg.use_proprio:
+            trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+        print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
+        optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+        if cfg.resume:
+            optimizer_state_dict = load_checkpoint("optimizer", cfg.resume_dir, resume_step)
+            optimizer.load_state_dict(optimizer_state_dict)
 
     # Record original learning rate
     original_lr = optimizer.param_groups[0]["lr"]

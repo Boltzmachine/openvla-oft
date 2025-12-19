@@ -59,27 +59,81 @@ class AttentionPooling(nn.Module):
         return x[:, 0, :]  # (B, dim)
 
 
-def gumbel_softmax(logits, tau=1, hard=True):
-    logits = torch.log(logits.softmax(-1))
-    output = F.gumbel_softmax(logits, tau=tau, hard=hard)
-    return output
+def sample_gumbel(shape, eps=1e-5):
+    U = torch.rand(shape)
+    return -torch.log(-torch.log(U + eps) + eps)
+
+
+def gumbel_softmax_sample(logits, temperature):
+    y = logits + sample_gumbel(logits.size()).to(logits.device)
+    return F.softmax(y / temperature, dim=-1)
+
+def gumbel_softmax(logits, temperature=1., hard=True):
+    """
+    ST-gumple-softmax
+    input: [*, n_class]
+    return: flatten --> [*, n_class] an one-hot vector
+    """
+    y = gumbel_softmax_sample(logits, temperature)
+    
+    if not hard:
+        return y
+
+    shape = y.size()
+    _, ind = y.max(dim=-1)
+    y_hard = torch.zeros_like(y).view(-1, shape[-1])
+    y_hard.scatter_(1, ind.view(-1, 1), 1)
+    y_hard = y_hard.view(*shape)
+    # Set gradients w.r.t. y_hard gradients w.r.t. y
+    y_hard = (y_hard - y).detach() + y
+    return y_hard
+
+# class CacheGate(nn.Module):
+#     def __init__(self, dim):
+#         super().__init__()
+#         # self.dim_reducer = nn.Sequential(
+#         #     nn.Linear(dim, hidden_dim),
+#         #     nn.GELU(),
+#         #     nn.Linear(hidden_dim, dim),
+#         # )
+#         self.type_embedder = nn.Embedding(2, dim)
+#         self.cls_embedding = nn.Parameter(torch.randn(1, 1, dim))
+#         self.transformer = Transformer(
+#             d_model=dim,
+#             n_layers=2,
+#             n_heads=8,
+#         )
+#         self.head = nn.Linear(dim, 2)
+
+#     def forward(self, x_past, x_curr):
+#         """
+#         x_past - [B, N, d]
+#         x_curr - [B, N, d]
+#         """
+#         types = torch.tensor([0] * x_past.shape[1] + [1] * x_curr.shape[1], device=x_past.device).unsqueeze(0)  # (1, 2N)
+#         x_past_curr = torch.cat([x_past, x_curr], dim=1)  + self.type_embedder(types) # (B, 2N, D)
+#         sequence = torch.cat([self.cls_embedding.expand(x_past_curr.shape[0], -1, -1), x_past_curr], dim=1) # (B, 2N+1, D)
+#         sequence = self.transformer(sequence)
+#         gate = self.head(sequence[:, 0, :])  # (B, dim)
+#         gate = gumbel_softmax(gate, hard=True)
+#         return gate
+
 
 class CacheGate(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        # self.dim_reducer = nn.Sequential(
-        #     nn.Linear(dim, hidden_dim),
-        #     nn.GELU(),
-        #     nn.Linear(hidden_dim, dim),
-        # )
-        self.type_embedder = nn.Embedding(2, dim)
-        self.cls_embedding = nn.Parameter(torch.randn(1, 1, dim))
-        self.transformer = Transformer(
-            d_model=dim,
-            n_layers=2,
-            n_heads=8,
+        self.dim_reduction_vertical = nn.Sequential(
+            nn.Linear(2 * dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, 128),
         )
-        self.head = nn.Linear(dim, 2)
+        self.dim_reduction_horizontal = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 64),
+        )
+
+        self.head = nn.Linear(128 * 64, 2)
 
     def forward(self, x_past, x_curr):
         """
@@ -87,14 +141,14 @@ class CacheGate(nn.Module):
         x_curr - [B, N, d]
         """
         types = torch.tensor([0] * x_past.shape[1] + [1] * x_curr.shape[1], device=x_past.device).unsqueeze(0)  # (1, 2N)
-        x_past_curr = torch.cat([x_past, x_curr], dim=1)  + self.type_embedder(types) # (B, 2N, D)
-        sequence = torch.cat([self.cls_embedding.expand(x_past_curr.shape[0], -1, -1), x_past_curr], dim=1) # (B, 2N+1, D)
-        sequence = self.transformer(sequence)
-        gate = self.head(sequence[:, 0, :])  # (B, dim)
+        x_past_curr = torch.cat([x_past, x_curr], dim=-1)
+        x_past_curr = self.dim_reduction_vertical(x_past_curr)
+        x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
+        gate = self.head(x_past_curr.reshape(x_past_curr.shape[0], -1))
+        # gate = gate.softmax(-1)
         gate = gumbel_softmax(gate, hard=True)
         return gate
 
-                
 class DisentangleAdapter(nn.Module):
     def __init__(
         self,
