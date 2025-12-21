@@ -83,7 +83,7 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return_dict = dict(pixel_values=pixel_values, other_pixel_values=other_pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+        return_dict = dict(pixel_values=pixel_values, other_pixel_values=other_pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions, timestep=rlds_batch["observation"]['timestep'])
 
         # Add additional inputs
         if self.use_wrist_image:

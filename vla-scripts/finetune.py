@@ -366,7 +366,8 @@ def run_forward_pass(
             noisy_action_projector=noisy_action_projector if use_diffusion else None,
             diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
             use_film=use_film,
-            other_pixel_values=batch.get("other_pixel_values", None)
+            other_pixel_values=batch.get("other_pixel_values", None),
+            timestep=batch.get("timestep", None),
         )
 
     # Get action masks needed for logging
