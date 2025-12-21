@@ -508,7 +508,10 @@ def run_forward_pass(
         if use_cache_gate:
             choose_curr_penalty = output.choose_curr_penalty
             metrics['choose_curr_penalty'] = choose_curr_penalty.detach()
-            loss = loss + 0.0006 * choose_curr_penalty
+            loss = loss + 0.1 * choose_curr_penalty
+            entropy = output.cache_gate_entropy.mean()
+            metrics['entropy'] = entropy.detach()
+            loss = loss - 0.1 * entropy
             
         if 'commit_loss' in static:
             raise

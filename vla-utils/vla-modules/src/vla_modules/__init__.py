@@ -144,10 +144,13 @@ class CacheGate(nn.Module):
         x_past_curr = torch.cat([x_past, x_curr], dim=-1)
         x_past_curr = self.dim_reduction_vertical(x_past_curr)
         x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
-        gate = self.head(x_past_curr.reshape(x_past_curr.shape[0], -1))
-        # gate = gate.softmax(-1)
-        gate = gumbel_softmax(gate, hard=True)
-        return gate
+        logits = self.head(x_past_curr.reshape(x_past_curr.shape[0], -1))
+        logits = torch.clamp(logits, -10, 10)
+        entropy = - (logits.softmax(-1) * logits.log_softmax(-1)).sum(-1)
+        gate = gumbel_softmax(logits, hard=True)
+        if torch.isclose(entropy.mean(), torch.tensor(0., device=entropy.device)):
+            import ipdb; ipdb.set_trace()
+        return gate, entropy
 
 class DisentangleAdapter(nn.Module):
     def __init__(

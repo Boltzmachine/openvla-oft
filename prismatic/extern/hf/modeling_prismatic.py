@@ -337,6 +337,7 @@ class PrismaticCausalLMOutputWithPast(ModelOutput):
     projector_features: Optional[torch.FloatTensor] = None
     static_features: Optional[Tuple[torch.FloatTensor]] = None
     choose_curr_penalty: Optional[torch.FloatTensor] = None
+    cache_gate_entropy: Optional[torch.FloatTensor] = None
 
 
 class PrismaticPreTrainedModel(PreTrainedModel):
@@ -692,7 +693,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 static, dynamic = projected_patch_embeddings
                 if other_pixel_values is not None:
                     if self.config.use_cache_gate:
-                        gate = self.cache_gate(
+                        gate, entropy = self.cache_gate(
                             x_past=torch.cat([other_static['features'], other_dynamic], dim=1),
                             x_curr=torch.cat([static['features'], dynamic], dim=1)
                         )
@@ -802,6 +803,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             projector_features=projected_patch_embeddings,
             static_features=(static, other_static) if "static" in locals() and "other_static" in locals() else None,
             choose_curr_penalty=choose_curr_penalty if "choose_curr_penalty" in locals() else None,
+            cache_gate_entropy=entropy if "entropy" in locals() else None,
         )
 
     # === GenerationMixin Methods ===
