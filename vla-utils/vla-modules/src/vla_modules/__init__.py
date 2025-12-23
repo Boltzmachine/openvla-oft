@@ -88,6 +88,71 @@ def gumbel_softmax(logits, temperature=1., hard=True):
     y_hard = (y_hard - y).detach() + y
     return y_hard
 
+
+class CacheGateSimple(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.GELU(),
+            nn.Linear(64, 64),
+            nn.GELU(),
+            nn.Linear(64, 2),
+        )
+
+
+    def forward(self, x_past, x_curr, t_past, t_curr):
+        """
+        x_past - [B, N, d]
+        x_curr - [B, N, d]
+        """
+        delta = (t_curr.to(x_curr.dtype) - t_past.to(x_curr.dtype)).unsqueeze(-1)
+        logits = self.mlp(delta)
+        gate = gumbel_softmax(logits, hard=True)
+        return gate, logits
+    
+
+class CacheGate(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, 64),
+            nn.GELU(),
+            nn.Linear(64, 2),
+        )
+
+        self.dim_reduction_vertical = nn.Sequential(
+            nn.Linear(2 * dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, 128),
+        )
+        self.dim_reduction_horizontal = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 64),
+        )
+        self.head = nn.Linear(128 * 64, 64)
+
+        self.time_map = nn.Linear(1, 64)
+
+    def forward(self, x_past, x_curr, t_past, t_curr):
+        """
+        x_past - [B, N, d]
+        x_curr - [B, N, d]
+        """
+        delta = (t_curr.to(x_curr.dtype) - t_past.to(x_curr.dtype)).unsqueeze(-1) # (B, 1)
+
+        x_past_curr = torch.cat([x_past, x_curr], dim=-1)
+        x_past_curr = self.dim_reduction_vertical(x_past_curr)
+        x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
+        x_past_curr = self.head(x_past_curr.reshape(x_past_curr.shape[0], -1))
+
+        logits = self.mlp(torch.cat([self.time_map(delta), x_past_curr], dim=-1))
+        gate = gumbel_softmax(logits, hard=True)
+        return gate, logits
+
 # class CacheGate(nn.Module):
 #     def __init__(self, dim):
 #         super().__init__()
@@ -105,7 +170,7 @@ def gumbel_softmax(logits, temperature=1., hard=True):
 #         )
 #         self.head = nn.Linear(dim, 2)
 
-#     def forward(self, x_past, x_curr):
+#     def forward(self, x_past, x_curr, t_past, t_curr):
 #         """
 #         x_past - [B, N, d]
 #         x_curr - [B, N, d]
@@ -114,43 +179,69 @@ def gumbel_softmax(logits, temperature=1., hard=True):
 #         x_past_curr = torch.cat([x_past, x_curr], dim=1)  + self.type_embedder(types) # (B, 2N, D)
 #         sequence = torch.cat([self.cls_embedding.expand(x_past_curr.shape[0], -1, -1), x_past_curr], dim=1) # (B, 2N+1, D)
 #         sequence = self.transformer(sequence)
-#         gate = self.head(sequence[:, 0, :])  # (B, dim)
-#         gate = gumbel_softmax(gate, hard=True)
-#         return gate
+#         logits = self.head(sequence[:, 0, :])  # (B, dim)
+#         logits = torch.clamp(logits, -10, 10)
+#         entropy = - (logits.softmax(-1) * logits.log_softmax(-1)).sum(-1)
+#         gate = gumbel_softmax(logits, hard=True)
+#         return gate, entropy
 
-
-class CacheGate(nn.Module):
-    def __init__(self, dim):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
         super().__init__()
-        self.dim_reduction_vertical = nn.Sequential(
-            nn.Linear(2 * dim, dim),
-            nn.GELU(),
-            nn.Linear(dim, 128),
-        )
-        self.dim_reduction_horizontal = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.GELU(),
-            nn.Linear(128, 64),
-        )
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer('pe', pe)
 
-        self.head = nn.Linear(128 * 64, 2)
+    def forward(self, t):
+        return self.pe[:, t, :]
 
-    def forward(self, x_past, x_curr):
-        """
-        x_past - [B, N, d]
-        x_curr - [B, N, d]
-        """
-        types = torch.tensor([0] * x_past.shape[1] + [1] * x_curr.shape[1], device=x_past.device).unsqueeze(0)  # (1, 2N)
-        x_past_curr = torch.cat([x_past, x_curr], dim=-1)
-        x_past_curr = self.dim_reduction_vertical(x_past_curr)
-        x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
-        logits = self.head(x_past_curr.reshape(x_past_curr.shape[0], -1))
-        logits = torch.clamp(logits, -10, 10)
-        entropy = - (logits.softmax(-1) * logits.log_softmax(-1)).sum(-1)
-        gate = gumbel_softmax(logits, hard=True)
-        if torch.isclose(entropy.mean(), torch.tensor(0., device=entropy.device)):
-            import ipdb; ipdb.set_trace()
-        return gate, entropy
+
+# class CacheGate(nn.Module):
+#     def __init__(self, dim):
+#         super().__init__()
+#         self.dim_reduction_vertical = nn.Sequential(
+#             nn.Linear(2 * dim, dim),
+#             nn.GELU(),
+#             nn.Linear(dim, 128),
+#         )
+#         self.dim_reduction_horizontal = nn.Sequential(
+#             nn.Linear(256, 128),
+#             nn.GELU(),
+#             nn.Linear(128, 64),
+#         )
+
+#         self.time_mlp = nn.Sequential(
+#             nn.Linear(1, 64),
+#             nn.GELU(),
+#             nn.Linear(64, 64),
+#             nn.GELU(),
+#             nn.Linear(64, 2),
+#         )
+
+#         self.head = nn.Linear(128 * 64, 2)
+#         self.pe = nn.Embedding(1000, dim)
+
+#     def forward(self, x_past, x_curr, t_past, t_curr):
+#         """
+#         x_past - [B, N, d]
+#         x_curr - [B, N, d]
+#         t_past - [B]
+#         t_curr - [B]
+#         """
+#         # x_past_curr = torch.cat([x_past + self.pe(t_curr).unsqueeze(1), x_curr + self.pe(t_past).unsqueeze(1)], dim=-1)
+#         # x_past_curr = self.dim_reduction_vertical(x_past_curr)
+#         # x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
+#         # logits = self.head(x_past_curr.reshape(x_past_curr.shape[0], -1))
+
+#         logits = self.time_mlp((t_curr - t_past).unsqueeze(-1).to(x_curr.dtype))
+#         # delta = (t_curr.to(x_curr.dtype) - t_past.to(x_curr.dtype)).unsqueeze(-1)
+#         # logits = self.time_mlp(self.pe(delta.long().squeeze(-1)))
+#         gate = gumbel_softmax(logits, hard=True)
+#         return gate, logits
 
 class DisentangleAdapter(nn.Module):
     def __init__(

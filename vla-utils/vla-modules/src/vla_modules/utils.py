@@ -28,8 +28,8 @@ def patch_projector(self, static_ratio):
             self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
         
         if self.config.use_cache_gate:
-            from vla_modules import CacheGate
-            self.cache_gate = CacheGate(4096).to(self.language_model.device)
+            from vla_modules import CacheGate,  CacheGateSimple
+            self.cache_gate = CacheGateSimple(4096).to(self.language_model.device)
 
         return self
 

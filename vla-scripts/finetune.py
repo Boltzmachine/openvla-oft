@@ -510,9 +510,16 @@ def run_forward_pass(
             choose_curr_penalty = output.choose_curr_penalty
             metrics['choose_curr_penalty'] = choose_curr_penalty.detach()
             loss = loss + 0.1 * choose_curr_penalty
-            entropy = output.cache_gate_entropy.mean()
+            gate_logits = output.gate_logits
+
+            entropy = - (gate_logits.softmax(-1) * gate_logits.log_softmax(-1)).sum(-1).mean()
             metrics['entropy'] = entropy.detach()
             loss = loss - 0.1 * entropy
+
+            z_loss = torch.log(torch.exp(gate_logits).sum(-1)).pow(2).mean()
+            metrics['z_loss'] = z_loss.detach()
+            loss = loss + 0.001 * max(z_loss, 0.0)
+
             
         if 'commit_loss' in static:
             raise
@@ -713,7 +720,10 @@ def save_training_checkpoint(
         # Save processor and LoRA adapter
         open(checkpoint_dir / "modeling_prismatic.py", "w").write(modeling_file)
         processor.save_pretrained(checkpoint_dir)
-        vla.module.save_pretrained(adapter_dir)
+        if cfg.use_lora:
+            vla.module.save_pretrained(adapter_dir)
+        else:
+            vla.module.save_pretrained(checkpoint_dir)
         save_cfg(cfg, checkpoint_dir / "finetune_config.json")
         
         if optimizer is not None:
@@ -926,7 +936,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.resume:
         run_id = possible_ref_cfg.run_id
     if cfg.train_gate_only:
-        run_id = "gate-" + run_id
+        run_id = "gate3-" + run_id
     cfg.run_id = run_id
     # Create experiment run directory
     run_dir = cfg.run_root_dir / run_id
@@ -1272,10 +1282,24 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
+            # get max gradient
+            max_grad = 0.0
+            for param in vla.parameters():
+                if param.grad is not None:
+                    param_max_grad = param.grad.abs().max().item()
+                    if param_max_grad > max_grad:
+                        max_grad = param_max_grad
+
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
             log_step = gradient_step_idx if not cfg.resume else resume_step + gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+                wandb.log(
+                    {
+                        "VLA Train/Max Gradient": max_grad,
+                    },
+                    step=log_step,
+                )
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
