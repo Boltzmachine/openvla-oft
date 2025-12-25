@@ -443,8 +443,6 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
     @property
     def n_static_tokens(self):
-        if hasattr(self, 'disentangle_adapter'):
-            return self.disentangle_adapter.static_dim
         if hasattr(self.config, "static_ratio"):
             assert self.vision_backbone.get_num_patches() == 256
             return int(self.vision_backbone.get_num_patches() * self.config.static_ratio)
