@@ -917,8 +917,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     """
     modeling_file = open("prismatic/extern/hf/modeling_prismatic.py").read()
     possible_ref_cfg = check_cfg(cfg)
-    if not cfg.use_lora:
-        assert cfg.train_gate_only
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
@@ -1126,9 +1124,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
         print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
         optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
-        if cfg.resume:
-            optimizer_state_dict = load_checkpoint("optimizer", cfg.resume_dir, resume_step)
-            optimizer.load_state_dict(optimizer_state_dict)
+        # if cfg.resume:
+        #     optimizer_state_dict = load_checkpoint("optimizer", cfg.resume_dir, resume_step)
+        #     optimizer.load_state_dict(optimizer_state_dict)
 
     # Record original learning rate
     original_lr = optimizer.param_groups[0]["lr"]
@@ -1243,31 +1241,32 @@ def finetune(cfg: FinetuneConfig) -> None:
         for batch_idx, batch in enumerate(dataloader):
             # Compute training metrics and loss
             compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
-            loss, metrics = run_forward_pass(
-                vla=vla,
-                action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
-                noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
-                proprio_projector=proprio_projector if cfg.use_proprio else None,
-                batch=batch,
-                action_tokenizer=action_tokenizer,
-                device_id=device_id,
-                use_l1_regression=cfg.use_l1_regression,
-                use_diffusion=cfg.use_diffusion,
-                use_proprio=cfg.use_proprio,
-                use_film=cfg.use_film,
-                num_patches=NUM_PATCHES,
-                compute_diffusion_l1=compute_diffusion_l1,
-                num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
-                use_contrastive=cfg.use_contrastive,
-                use_cache_gate=cfg.use_cache_gate,
-            )
+            with torch.no_grad():
+                loss, metrics = run_forward_pass(
+                    vla=vla,
+                    action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
+                    noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
+                    proprio_projector=proprio_projector if cfg.use_proprio else None,
+                    batch=batch,
+                    action_tokenizer=action_tokenizer,
+                    device_id=device_id,
+                    use_l1_regression=cfg.use_l1_regression,
+                    use_diffusion=cfg.use_diffusion,
+                    use_proprio=cfg.use_proprio,
+                    use_film=cfg.use_film,
+                    num_patches=NUM_PATCHES,
+                    compute_diffusion_l1=compute_diffusion_l1,
+                    num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                    use_contrastive=cfg.use_contrastive,
+                    use_cache_gate=cfg.use_cache_gate,
+                )
 
-            # Normalize loss to account for gradient accumulation
-            normalized_loss = loss / cfg.grad_accumulation_steps
+                # Normalize loss to account for gradient accumulation
+                normalized_loss = loss / cfg.grad_accumulation_steps
 
-            # Backward pass
-            normalized_loss.backward()
-            torch.nn.utils.clip_grad_norm_(vla.parameters(), 0.8)
+                # Backward pass
+                # normalized_loss.backward()
+                torch.nn.utils.clip_grad_norm_(vla.parameters(), 0.8)
 
             # Store recent train metrics
             for metric_name, value in metrics.items():

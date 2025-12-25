@@ -419,7 +419,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.pad_token_id = config.pad_token_id
         self.llm_dim = config.text_config.hidden_size
 
-        if getattr(config, "disentangle_method", "none") != "none":
+        if getattr(config, "static_ratio", 0.0) > 0.0:
             patch_projector(self, self.config.static_ratio)
         else:
             self.config.disentangle_method = "none"
@@ -703,6 +703,28 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                         static_chosen = (gate[:, :, None, None] * torch.stack([other_static['features'], static['features']], dim=1)).sum(1)
                         projected_patch_embeddings = torch.cat([static_chosen, dynamic], dim=1)
                         choose_curr_penalty = gate[:, 1].mean()
+                        if __import__('os').environ.get("PLOT_GATE", "0") == "1":
+                            if not hasattr(self, 'gate_values'):
+                                self.gate_values = []
+                            for t, p in zip(timestep.cpu().numpy(), gate_logits.softmax(-1)[:, 1].float().detach().cpu().numpy()):
+                                self.gate_values.append((t[1]-t[0], p))
+
+                            if len(self.gate_values) >= 10000:
+                                import matplotlib.pyplot as plt
+                                ts, gs = zip(*self.gate_values)
+                                plt.scatter(ts, gs, label="gate logits")
+                                # simple linear regression fit
+                                slope, intercept = np.polyfit(ts, gs, 1)
+                                line_x = np.linspace(min(ts), max(ts), 100)
+                                line_y = slope * line_x + intercept
+                                plt.plot(line_x, line_y, color="red", label="linear fit")
+                                plt.xlabel('Timestep')
+                                plt.ylabel('Cache Gate Logit for Current Image')
+                                plt.title('Cache Gate Behavior')
+                                plt.legend()
+                                plt.savefig('cache_gate_behavior.png')
+                                self.gate_values = []
+                                import ipdb; ipdb.set_trace()
                     else:
                         if random.random() < self.config.invswap_ratio:
                             projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)

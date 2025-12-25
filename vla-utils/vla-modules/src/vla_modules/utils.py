@@ -9,7 +9,8 @@ def postset_model(vla, cfg):
     vla.config.disentangle_method = cfg.disentangle
     vla.config.use_cache_gate = cfg.use_cache_gate
     vla.config.backward_window_size = cfg.backward_window_size
-    vla.patch_projector(cfg.static_ratio)
+    if not getattr(vla, '_is_patched', False):
+        vla.patch_projector(cfg.static_ratio)
 
 def patch_projector(self, static_ratio):
         if "none" not in self.config.disentangle_method:
@@ -30,6 +31,7 @@ def patch_projector(self, static_ratio):
         if self.config.use_cache_gate:
             from vla_modules import CacheGate,  CacheGateSimple
             self.cache_gate = CacheGateSimple(4096).to(self.language_model.device)
+        self._is_patched = True
 
         return self
 
