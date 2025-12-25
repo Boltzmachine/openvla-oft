@@ -31,6 +31,7 @@ from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
+import matplotlib.pyplot as plt
 
 import wandb
 
@@ -310,6 +311,7 @@ def run_forward_pass(
     num_diffusion_steps_train=None,
     use_contrastive=False,
     use_cache_gate=False,
+    gate_logits_list=None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -369,6 +371,11 @@ def run_forward_pass(
             other_pixel_values=batch.get("other_pixel_values", None),
             timestep=batch.get("timestep", None),
         )
+    
+    if gate_logits_list is not None and getattr(output, "gate_logits", None) is not None:
+        timestep = batch.get("timestep", None)
+        for t, p in zip(timestep.cpu().numpy(), output.gate_logits.softmax(-1)[:, 1].float().detach().cpu().numpy()):
+            gate_logits_list.append((t[1]-t[0], p))
 
     # Get action masks needed for logging
     ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
@@ -1234,6 +1241,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
+    gate_logits_list = deque(maxlen=5000)
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         if cfg.resume:
@@ -1260,6 +1268,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 use_contrastive=cfg.use_contrastive,
                 use_cache_gate=cfg.use_cache_gate,
+                gate_logits_list=gate_logits_list,
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1342,6 +1351,21 @@ def finetune(cfg: FinetuneConfig) -> None:
                     distributed_state=distributed_state,
                     modeling_file=modeling_file
                 )
+                if distributed_state.is_main_process and gate_logits_list is not None:
+                    if len(gate_logits_list) > 0:
+                        ts, gs = zip(*gate_logits_list)
+                        plt.cla()
+                        plt.scatter(ts, gs, label="gate logits")
+                        # simple linear regression fit
+                        slope, intercept = np.polyfit(ts, gs, 1)
+                        line_x = np.linspace(min(ts), max(ts), 100)
+                        line_y = slope * line_x + intercept
+                        plt.plot(line_x, line_y, color="red", label="linear fit")
+                        plt.xlabel('Timestep')
+                        plt.ylabel('Cache Gate Logit for Current Image')
+                        plt.title('Cache Gate Behavior')
+                        plt.legend()
+                        plt.savefig(run_dir / f'cache_gate_behavior_{log_step}.png')
 
             # Test model on validation set
             if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
