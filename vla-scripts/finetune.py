@@ -44,6 +44,7 @@ from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.modeling_memoryvla import MemoryVLAForActionPrediction
 from prismatic.extern.hf.modeling_contextvla import ContextVLAForActionPrediction
+from prismatic.extern.hf.modeling_tracevla import TraceProcessor
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
@@ -143,6 +144,8 @@ def initialize_vla(cfg):
     elif cfg.baseline == "contextvla":
         model_class = ContextVLAForActionPrediction
     elif cfg.baseline == "none":
+        model_class = OpenVLAForActionPrediction
+    elif cfg.baseline == 'tracevla':
         model_class = OpenVLAForActionPrediction
     else:
         raise ValueError(f"Unknown baseline: {cfg.baseline}")
@@ -977,7 +980,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     vla = initialize_vla(cfg).to(device_id)
 
     # Set number of images in VLA input
-    vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+    if cfg.baseline != 'tracevla':
+        vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
     # LoRA setup
     if cfg.use_lora:
@@ -1092,6 +1096,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         NUM_PATCHES = vla.module.vision_backbone.get_num_patches() + 1
     elif cfg.baseline == "memoryvla":
         NUM_PATCHES = vla.module.vision_backbone.get_num_patches()
+    elif cfg.baseline == "tracevla":
+        NUM_PATCHES = vla.module.vision_backbone.get_num_patches()
     else:
         raise NotImplementedError
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
@@ -1156,6 +1162,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         action_tokenizer,
         processor.tokenizer,
         image_transform=processor.image_processor.apply_transform,
+        trace_processor=TraceProcessor("co-tracker/checkpoints/scaled_offline.pth", redraw_frequency=20) if cfg.baseline == 'tracevla' else None,
         prompt_builder_fn=PurePromptBuilder,
         use_wrist_image=use_wrist_image,
         use_proprio=cfg.use_proprio,

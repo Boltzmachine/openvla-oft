@@ -23,12 +23,14 @@ from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
 from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
+from prismatic.extern.hf.modeling_tracevla import TraceProcessor
 
 @dataclass
 class RLDSBatchTransform:
     action_tokenizer: ActionTokenizer
     base_tokenizer: PreTrainedTokenizerBase
     image_transform: ImageTransform
+    trace_processor: TraceProcessor
     prompt_builder_fn: Type[PromptBuilder]
     predict_stop_token: bool = True
     use_wrist_image: bool = False
@@ -103,6 +105,13 @@ class RLDSBatchTransform:
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
             return_dict["proprio"] = proprio
+
+        if self.trace_processor is not None:
+            self.trace_processor.reset()
+            assert isinstance(img, list)
+            for im in img:
+                image_overlaid, has_trace = self.trace_processor.process_image(im)
+            return_dict['pixel_values'] = self.image_transform(image_overlaid)
 
         return return_dict
 
