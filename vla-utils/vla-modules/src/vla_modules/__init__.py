@@ -68,7 +68,7 @@ def gumbel_softmax_sample(logits, temperature):
     y = logits + sample_gumbel(logits.size()).to(logits.device)
     return F.softmax(y / temperature, dim=-1)
 
-def gumbel_softmax(logits, temperature=1., hard=True):
+def gumbel_softmax(logits, temperature=1., hard=True, use_uniform=False):
     """
     ST-gumple-softmax
     input: [*, n_class]
@@ -81,6 +81,8 @@ def gumbel_softmax(logits, temperature=1., hard=True):
 
     shape = y.size()
     _, ind = y.max(dim=-1)
+    if use_uniform:
+        ind = (torch.rand_like(ind.float()) > 0.5).long()
     y_hard = torch.zeros_like(y).view(-1, shape[-1])
     y_hard.scatter_(1, ind.view(-1, 1), 1)
     y_hard = y_hard.view(*shape)
@@ -116,7 +118,7 @@ class CacheGate(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(64, 64),
             nn.GELU(),
             nn.Linear(64, 64),
             nn.GELU(),
@@ -149,8 +151,42 @@ class CacheGate(nn.Module):
         x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
         x_past_curr = self.head(x_past_curr.reshape(x_past_curr.shape[0], -1))
 
-        logits = self.mlp(torch.cat([self.time_map(delta), x_past_curr], dim=-1))
-        gate = gumbel_softmax(logits, hard=True)
+        # logits = self.mlp(torch.cat([self.time_map(delta), torch.zeros_like(x_past_curr)], dim=-1))
+        logits = self.mlp(self.time_map(delta))
+        gate = gumbel_softmax(logits, hard=True, use_uniform=True)
+        return gate, logits
+
+
+class CacheGateImage(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim_reduction_vertical = nn.Sequential(
+            nn.Linear(2 * dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, 128),
+        )
+        self.dim_reduction_horizontal = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 128),
+            nn.GELU(),
+            nn.Linear(128, 64),
+        )
+        self.head = nn.Linear(128 * 64, 2)
+
+    def forward(self, x_past, x_curr, t_past, t_curr):
+        """
+        x_past - [B, N, d]
+        x_curr - [B, N, d]
+        """
+        x_past_curr = torch.cat([x_past, x_curr], dim=-1)
+        x_past_curr = self.dim_reduction_vertical(x_past_curr)
+        x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
+        logits = self.head(x_past_curr.reshape(x_past_curr.shape[0], -1))
+
+        gate = gumbel_softmax(logits, hard=True, use_uniform=True)
         return gate, logits
 
 # class CacheGate(nn.Module):

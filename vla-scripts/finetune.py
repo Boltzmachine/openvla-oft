@@ -514,18 +514,34 @@ def run_forward_pass(
                 loss = loss + 0.1 * nce_loss
 
         if use_cache_gate:
-            choose_curr_penalty = output.choose_curr_penalty
-            metrics['choose_curr_penalty'] = choose_curr_penalty.detach()
-            loss = loss + 0.1 * choose_curr_penalty
-            gate_logits = output.gate_logits
+            use_prior_reg = True
+            if use_prior_reg:
+                timestep = batch['timestep'].to(device_id)
+                time_delta = timestep[:, 1] - timestep[:, 0]  # (B,)
+                gt_prob = torch.exp(-time_delta.float() / 10)  # (B,)
+                gt_prob = torch.stack([gt_prob, 1 - gt_prob], dim=-1)  # (B, 2)
+                gate_logits = output.gate_logits.to(loss.dtype)
+                log_gate_prob = gate_logits.log_softmax(-1)
+                prob_reg_loss = - (gt_prob * log_gate_prob).sum(-1).mean()
+                metrics['prob_reg_loss'] = prob_reg_loss.detach()
+                loss = loss + 0.1 * prob_reg_loss
 
-            entropy = - (gate_logits.softmax(-1) * gate_logits.log_softmax(-1)).sum(-1).mean()
-            metrics['entropy'] = entropy.detach()
-            loss = loss - 0.1 * entropy
+                z_loss = torch.log(torch.exp(gate_logits).sum(-1)).pow(2).mean()
+                metrics['z_loss'] = z_loss.detach()
+                loss = loss + 0.0001 * max(z_loss, 0.0)
+            else:
+                choose_curr_penalty = output.choose_curr_penalty
+                metrics['choose_curr_penalty'] = choose_curr_penalty.detach()
+                loss = loss + 0.1 * choose_curr_penalty
+                gate_logits = output.gate_logits.to(loss.dtype)
 
-            z_loss = torch.log(torch.exp(gate_logits).sum(-1)).pow(2).mean()
-            metrics['z_loss'] = z_loss.detach()
-            loss = loss + 0.001 * max(z_loss, 0.0)
+                entropy = - (gate_logits.softmax(-1) * gate_logits.log_softmax(-1)).sum(-1).mean()
+                metrics['entropy'] = entropy.detach()
+                loss = loss - 0.1 * entropy
+
+                z_loss = torch.log(torch.exp(gate_logits).sum(-1)).pow(2).mean()
+                metrics['z_loss'] = z_loss.detach()
+                loss = loss + 0.001 * max(z_loss, 0.0)
 
             
         if 'commit_loss' in static:
@@ -1353,6 +1369,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 )
                 if distributed_state.is_main_process and gate_logits_list is not None:
                     if len(gate_logits_list) > 0:
+                        np.save(run_dir / f'cache_gate_logits_{log_step}.npy', np.array(list(gate_logits_list)))
                         ts, gs = zip(*gate_logits_list)
                         plt.cla()
                         plt.scatter(ts, gs, label="gate logits")

@@ -24,12 +24,10 @@ def patch_projector(self, static_ratio):
             else:
                 raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
             self.disentangle_adapter = DisentangleAdapter(static_ratio=static_ratio, hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer).to(self.language_model.device)
-        if 'nce' in self.config.disentangle_method:
-            self.attn_pooler = AttentionPooling(4096).to(self.language_model.device) #FIXME
-        
+
         if self.config.use_cache_gate:
-            from vla_modules import CacheGate,  CacheGateSimple
-            self.cache_gate = CacheGate(4096).to(self.language_model.device)
+            from vla_modules import CacheGate, CacheGateImage, CacheGateSimple
+            self.cache_gate = CacheGateImage(4096).to(self.language_model.device)
 
         return self
 

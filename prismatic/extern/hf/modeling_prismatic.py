@@ -695,14 +695,14 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 if other_pixel_values is not None:
                     if self.config.use_cache_gate:
                         gate, gate_logits = self.cache_gate(
-                            x_past=torch.cat([other_static['features'], other_dynamic], dim=1),
-                            x_curr=torch.cat([static['features'], dynamic], dim=1),
+                            x_past=torch.cat([other_static['features'], other_dynamic], dim=1).to(torch.float32),
+                            x_curr=torch.cat([static['features'], dynamic], dim=1).to(torch.float32),
                             t_past=timestep[..., 0],
                             t_curr=timestep[..., 1],
                         )
                         static_chosen = (gate[:, :, None, None] * torch.stack([other_static['features'], static['features']], dim=1)).sum(1)
                         projected_patch_embeddings = torch.cat([static_chosen, dynamic], dim=1)
-                        choose_curr_penalty = gate[:, 1].mean()
+                        choose_curr_penalty = gate[:, 1].mean().to(pixel_values.dtype)
                     else:
                         if random.random() < self.config.invswap_ratio:
                             projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
