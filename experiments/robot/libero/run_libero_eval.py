@@ -319,7 +319,11 @@ def run_episode(
     replay_images = []
     replay_observations = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
-    max_cache_steps = 2 if model.config.static_ratio > 0 else 0
+    if model.config.use_cache_gate:
+        max_cache_steps = 1000000 # leave model to decide when to recache
+        model.history_image = None
+    else:
+        max_cache_steps = 3 if model.config.static_ratio > 0 else 0
     cache_steps = 0
 
     # Run episode
@@ -338,9 +342,9 @@ def run_episode(
 
         # If action queue is empty, requery model
         if len(action_queue) == 0:
-            history_index = -1 if cache is None else -9
+            # history_index = -1 if cache is None else -17
             # observation = {'full_image': get_bounded_from_index(replay_observations, history_index)['full_image']}
-            history_image = get_bounded_from_index(replay_observations, history_index)['full_image']
+            # history_image = get_bounded_from_index(replay_observations, history_index)['full_image']
             # Query model to get action
             actions, cache = get_action(
                 cfg,
@@ -352,7 +356,7 @@ def run_episode(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 use_film=cfg.use_film,
-                history_image=None, #history_image,
+                # history_image=model.history_image,
                 cache=cache,
             )
             action_queue.extend(actions)

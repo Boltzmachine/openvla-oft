@@ -419,7 +419,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.pad_token_id = config.pad_token_id
         self.llm_dim = config.text_config.hidden_size
 
-        if getattr(config, "disentangle_method", "none") != "none":
+        if getattr(config, "static_ratio", 0.0) > 0.0:
             patch_projector(self, self.config.static_ratio)
         else:
             self.config.disentangle_method = "none"
@@ -1230,7 +1230,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=kwargs.get("other_pixel_values", None) is not None)
+        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=True)
         if isinstance(projected_patch_embeddings, tuple):
             static, dynamic = projected_patch_embeddings
         
@@ -1238,11 +1238,35 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film, use_disentangle=True)
             if isinstance(other_image_features, tuple):
                 other_static, other_dynamic = other_image_features
-                static = other_static
-        
+
+        if getattr(self.config, "use_cache_gate", False):
+            if self.history_image is None:
+                self.history_image = projected_patch_embeddings
+                if not hasattr(self, 'time_gaps'):
+                    self.time_gaps = []
+                self.time_gaps.append(0)
+            else:
+                other_static, other_dynamic = self.history_image
+                _, gate_logits = self.cache_gate(
+                    x_past=torch.cat([other_static['features'], other_dynamic], dim=1),
+                    x_curr=torch.cat([static['features'], dynamic], dim=1),
+                    t_past=None,
+                    t_curr=None,
+                )
+                recache_prob = gate_logits.softmax(dim=-1)[:, 1].item() # batch size must be 1
+                if not hasattr(self, 'recache_probs'):
+                    self.recache_probs = []
+                self.recache_probs.append(recache_prob)
+                if recache_prob > 0.7:
+                    cache = None
+                    self.history_image = projected_patch_embeddings
+                    self.time_gaps.append(0)
+                else:
+                    self.time_gaps[-1] += 1
+
         if isinstance(projected_patch_embeddings, tuple):
             projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
-            
+        
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
         if use_proprio:
