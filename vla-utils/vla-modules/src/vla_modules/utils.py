@@ -12,24 +12,28 @@ def postset_model(vla, cfg):
     vla.patch_projector(cfg.static_ratio)
 
 def patch_projector(self, static_ratio):
-        if "none" not in self.config.disentangle_method:
-            if "extra" in self.config.disentangle_method:
-                self.config.backbone = "query_transformer"
-                self.config.quantizer = "none"
-                hidden_dim = 4096
-            elif 'inject' in self.config.disentangle_method:
-                self.config.backbone = "none"
-                self.config.quantizer = "none"
-                hidden_dim = 1024
-            else:
-                raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
-            self.disentangle_adapter = DisentangleAdapter(static_ratio=static_ratio, hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer).to(self.language_model.device)
+    assert not getattr(self, '_is_patched', False), "Model has already been patched."
 
-        if self.config.use_cache_gate:
-            from vla_modules import CacheGate, CacheGateImage, CacheGateSimple
-            self.cache_gate = CacheGateImage(4096).to(self.language_model.device)
+    if "none" not in self.config.disentangle_method:
+        if "extra" in self.config.disentangle_method:
+            self.config.backbone = "query_transformer"
+            self.config.quantizer = "none"
+            hidden_dim = 4096
+        elif 'inject' in self.config.disentangle_method:
+            self.config.backbone = "none"
+            self.config.quantizer = "none"
+            hidden_dim = 1024
+        else:
+            raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
+        self.disentangle_adapter = DisentangleAdapter(static_ratio=static_ratio, hidden_dim=hidden_dim, backbone=self.config.backbone, quantizer=self.config.quantizer).to(self.language_model.device)
 
-        return self
+    if self.config.use_cache_gate:
+        from vla_modules import CacheGate, CacheGateImage, CacheGateSimple
+        self.cache_gate = CacheGateImage(4096, static_ratio=static_ratio).to(self.language_model.device)
+
+    self._is_patched = True
+
+    return self
 
 import os
 import cv2

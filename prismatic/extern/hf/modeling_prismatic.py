@@ -418,7 +418,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.pad_token_id = config.pad_token_id
         self.llm_dim = config.text_config.hidden_size
 
-        if getattr(config, "static_ratio", 0.0) > 0.0:
+        if isinstance(getattr(config, "static_ratio", 0.0), list) or getattr(config, "static_ratio", 0.0) > 0.0:
             patch_projector(self, self.config.static_ratio)
         else:
             self.config.disentangle_method = "none"
@@ -1199,10 +1199,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
     
     def truncate_cache(
         self,
-        past_key_values
+        past_key_values,
+        length=None,
     ):
+        if length is None:
+            length = self.n_static_tokens
+            if isinstance(length, list):
+                length = sum(length)
         past_key_values = tuple(
-            (k_cache[:, :, :self.n_static_tokens, :], v_cache[:, :, :self.n_static_tokens, :])
+            (k_cache[:, :, :length, :], v_cache[:, :, :length, :])
             for k_cache, v_cache in past_key_values
         )
         return past_key_values
@@ -1269,40 +1274,71 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Process vision features
         projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=True)
         if isinstance(projected_patch_embeddings, tuple):
-            static, dynamic = projected_patch_embeddings
+            image_features, static, dynamic = projected_patch_embeddings
         
         if (other_pixel_values := kwargs.get("other_pixel_values", None)) is not None:
             other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film, use_disentangle=True)
             if isinstance(other_image_features, tuple):
-                other_static, other_dynamic = other_image_features
+                other_image_features, other_static, other_dynamic = other_image_features
 
         if getattr(self.config, "use_cache_gate", False):
+            past_key_values = None
             if self.history_image is None:
-                self.history_image = projected_patch_embeddings
-                if not hasattr(self, 'time_gaps'):
-                    self.time_gaps = []
-                self.time_gaps.append(0)
+                self.history_image = (projected_patch_embeddings, projected_patch_embeddings)
+                if isinstance(self.config.static_ratio, int):
+                    if not hasattr(self, 'time_gaps'):
+                        self.time_gaps = []
+                    self.time_gaps.append(0)
+                elif isinstance(self.config.static_ratio, list):
+                    if not hasattr(self, 'time_gaps'):
+                        self.time_gaps = [[] for _ in range(len(self.config.static_ratio))]
+                    for time_gaps in self.time_gaps:
+                        time_gaps.append(0)
             else:
-                other_static, other_dynamic = self.history_image
+                other_image_features, other_static, other_dynamic = map(list, zip(*self.history_image))
                 _, gate_logits = self.cache_gate(
-                    x_past=torch.cat([other_static['features'], other_dynamic], dim=1),
-                    x_curr=torch.cat([static['features'], dynamic], dim=1),
+                    x_past=other_image_features,
+                    x_curr=image_features,
                     t_past=None,
                     t_curr=None,
                 )
-                recache_prob = gate_logits.softmax(dim=-1)[:, 1].item() # batch size must be 1
-                if not hasattr(self, 'recache_probs'):
-                    self.recache_probs = []
-                self.recache_probs.append(recache_prob)
-                if recache_prob > 0.7:
-                    cache = None
-                    self.history_image = projected_patch_embeddings
-                    self.time_gaps.append(0)
+                if isinstance(gate_logits, list):
+                    recache_prob = tuple(gl.softmax(dim=-1)[:, 1].item() for gl in gate_logits) # batch size must be 1
+                    if not hasattr(self, 'recache_probs'):
+                        self.recache_probs = []
+                    self.recache_probs.append(recache_prob)
+                    assert len(recache_prob) == 2 #FIXME: only support 2 images now
+                    for i, recache_p in enumerate(recache_prob):
+                        if i == 0:
+                            if recache_p > 0.9:
+                                cache = None
+                                self.history_image = (projected_patch_embeddings, projected_patch_embeddings)
+                                for time_gaps in self.time_gaps:
+                                    time_gaps.append(0)
+                                break
+                            else:
+                                self.time_gaps[0][-1] += 1
+                        else:
+                            if recache_p > 0.7:
+                                cache = self.truncate_cache(cache, length=self.n_static_tokens[i-1])
+                                self.history_image = (self.history_image[0], projected_patch_embeddings)
+                                self.time_gaps[i].append(0)
+                            else:
+                                self.time_gaps[i][-1] += 1
                 else:
-                    self.time_gaps[-1] += 1
+                    recache_prob = gate_logits.softmax(dim=-1)[:, 1].item() # batch size must be 1
+                    if not hasattr(self, 'recache_probs'):
+                        self.recache_probs = []
+                    self.recache_probs.append(recache_prob)
+                    if recache_prob > 0.7:
+                        cache = None
+                        self.history_image = projected_patch_embeddings
+                        self.time_gaps.append(0)
+                    else:
+                        self.time_gaps[-1] += 1
 
         if isinstance(projected_patch_embeddings, tuple):
-            projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+            projected_patch_embeddings = image_features
         
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
