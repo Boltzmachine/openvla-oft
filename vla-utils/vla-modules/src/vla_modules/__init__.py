@@ -158,7 +158,7 @@ class CacheGate(nn.Module):
 
 
 class CacheGateImage(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, static_ratio=None):
         super().__init__()
         self.dim_reduction_vertical = nn.Sequential(
             nn.Linear(2 * dim, dim),
@@ -174,20 +174,44 @@ class CacheGateImage(nn.Module):
             nn.GELU(),
             nn.Linear(128, 64),
         )
-        self.head = nn.Linear(128 * 64, 2)
 
+        if isinstance(static_ratio, float) or static_ratio is None:
+            self.head = nn.Linear(128 * 64, 2)
+        elif isinstance(static_ratio, list):
+            self.head = nn.ModuleList(
+                nn.Linear(128 * 64, 2) for _ in static_ratio
+            )
+        
     def forward(self, x_past, x_curr, t_past, t_curr):
         """
         x_past - [B, N, d]
         x_curr - [B, N, d]
         """
-        x_past_curr = torch.cat([x_past, x_curr], dim=-1)
-        x_past_curr = self.dim_reduction_vertical(x_past_curr)
-        x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
-        logits = self.head(x_past_curr.reshape(x_past_curr.shape[0], -1))
-
-        gate = gumbel_softmax(logits, hard=True, use_uniform=True)
-        return gate, logits
+        if isinstance(self.head, nn.ModuleList):
+            all_gate = []
+            all_logits = []
+            assert isinstance(x_past, list) and len(x_past) == len(self.head    )
+            for i, (_x_past, head) in enumerate(zip(x_past, self.head)):
+                x_past_curr = torch.cat([_x_past, x_curr], dim=-1)
+                x_past_curr = self.dim_reduction_vertical(x_past_curr)
+                x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
+                logits = head(x_past_curr.reshape(x_past_curr.shape[0], -1))
+                if i == 0:
+                    gate = gumbel_softmax(logits, hard=True, use_uniform=True)
+                else:
+                    gate_temp = gumbel_softmax(logits, hard=True, use_uniform=True)
+                    use_curr = gate[:, 1:2].bool()
+                    gate = gate * use_curr + gate_temp * (~use_curr)
+                all_gate.append(gate)
+                all_logits.append(logits)
+            return all_gate, all_logits
+        else:
+            x_past_curr = torch.cat([x_past, x_curr], dim=-1)
+            x_past_curr = self.dim_reduction_vertical(x_past_curr)
+            x_past_curr = self.dim_reduction_horizontal(x_past_curr.transpose(-1, -2)).transpose(-1, -2)
+            logits = self.head(x_past_curr.reshape(x_past_curr.shape[0], -1))
+            gate = gumbel_softmax(logits, hard=True, use_uniform=True)
+            return gate, logits
 
 # class CacheGate(nn.Module):
 #     def __init__(self, dim):

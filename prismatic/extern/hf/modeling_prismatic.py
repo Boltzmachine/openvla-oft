@@ -336,7 +336,6 @@ class PrismaticCausalLMOutputWithPast(ModelOutput):
     # Additions for VLMs
     projector_features: Optional[torch.FloatTensor] = None
     static_features: Optional[Tuple[torch.FloatTensor]] = None
-    choose_curr_penalty: Optional[torch.FloatTensor] = None
     gate_logits: Optional[torch.FloatTensor] = None
 
 
@@ -433,7 +432,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return self.disentangle_adapter.static_dim
         if hasattr(self.config, "static_ratio"):
             assert self.vision_backbone.get_num_patches() == 256
-            return int(self.vision_backbone.get_num_patches() * self.config.static_ratio)
+            if isinstance(self.config.static_ratio, float):
+                return int(self.vision_backbone.get_num_patches() * self.config.static_ratio)
+            elif isinstance(self.config.static_ratio, list):
+                return [int(self.vision_backbone.get_num_patches() * r) for r in self.config.static_ratio]
         raise ValueError("Cannot determine number of static tokens!")
                 
     def patch_projector(self, static_ratio):
@@ -540,7 +542,17 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
         elif use_disentangle:
             static_dim = self.n_static_tokens
-            return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
+            if isinstance(static_dim, int):
+                return patch_features, { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
+            elif isinstance(static_dim, list):
+                statics = []
+                static_cum = 0
+                for i, dim in enumerate(static_dim):
+                    statics.append({ "features": patch_features[:, static_cum:static_cum+dim] })
+                    static_cum += dim
+                return patch_features, tuple(statics), patch_features[:, static_cum:]
+            else:
+                raise ValueError("Invalid type for static_dim!")
         else:
             return patch_features
 
@@ -683,26 +695,52 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             )  # (B, lang_seq_len, llm_dim)
             if other_pixel_values is not None and getattr(self.config, "invswap_ratio", 1.0) < 1.0:
                 assert not use_film
-                # selected_future_index = torch.randint(0, other_pixel_values.size(1), (1,)).item()
-                other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film, use_disentangle=True)
-                if isinstance(other_image_features, tuple):
-                    other_static, other_dynamic = other_image_features
+                if other_pixel_values.dim() == 5:
+                    other_image_features = []
+                    other_static = []
+                    other_dynamic = []
+                    for i in range(other_pixel_values.size(1)):
+                        other_image_features_ = self._process_vision_features(other_pixel_values[:, i], language_embeddings, use_film, use_disentangle=True)
+                        if isinstance(other_image_features_, tuple):
+                            other, other_s, other_d = other_image_features_
+                            other_image_features.append(other)
+                            other_static.append(other_s)
+                            other_dynamic.append(other_d)
+                else:
+                    # selected_future_index = torch.randint(0, other_pixel_values.size(1), (1,)).item()
+                    other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film, use_disentangle=True)
+                    if isinstance(other_image_features, tuple):
+                        other_image_features, other_static, other_dynamic = other_image_features
             
             # Get visual features
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=other_pixel_values is not None)
             if isinstance(projected_patch_embeddings, tuple):
-                static, dynamic = projected_patch_embeddings
+                image_features, static, dynamic = projected_patch_embeddings
                 if other_pixel_values is not None:
                     if self.config.use_cache_gate:
                         gate, gate_logits = self.cache_gate(
-                            x_past=torch.cat([other_static['features'], other_dynamic], dim=1).to(torch.float32),
-                            x_curr=torch.cat([static['features'], dynamic], dim=1).to(torch.float32),
-                            t_past=timestep[..., 0],
-                            t_curr=timestep[..., 1],
+                            x_past=other_image_features,
+                            x_curr=image_features,
+                            t_past=timestep[..., 0], #DERPRECATED FIXME
+                            t_curr=timestep[..., 1], #DERPRECATED FIXME
                         )
-                        static_chosen = (gate[:, :, None, None] * torch.stack([other_static['features'], static['features']], dim=1)).sum(1)
-                        projected_patch_embeddings = torch.cat([static_chosen, dynamic], dim=1)
-                        choose_curr_penalty = gate[:, 1].mean().to(pixel_values.dtype)
+                        if isinstance(gate, list):
+                            static_chosens = []
+                            prev_g = None
+                            for i in range(len(gate)):
+                                g = gate[i]
+                                os = other_static[i][i]
+                                cs = static[i]
+                                static_chosen = (g[:, :, None, None] * torch.stack([os['features'], cs['features']], dim=1)).sum(1)
+                                static_chosens.append(static_chosen)
+                                if prev_g is not None:
+                                    assert ((prev_g[:, 1] - g[:, 1]) < 1e-5).all()
+                                prev_g = g
+                            static_chosens = torch.cat(static_chosens, dim=1)
+                            projected_patch_embeddings = torch.cat([static_chosens, dynamic], dim=1).contiguous()
+                        else:
+                            static_chosen = (gate[:, :, None, None] * torch.stack([other_static['features'], static['features']], dim=1)).sum(1)
+                            projected_patch_embeddings = torch.cat([static_chosen, dynamic], dim=1)
                     else:
                         if random.random() < self.config.invswap_ratio:
                             projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
@@ -805,7 +843,6 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             attentions=language_model_output.attentions,
             projector_features=projected_patch_embeddings,
             static_features=(static, other_static) if "static" in locals() and "other_static" in locals() else None,
-            choose_curr_penalty=choose_curr_penalty if "choose_curr_penalty" in locals() else None,
             gate_logits=gate_logits if "gate_logits" in locals() else None,
         )
 

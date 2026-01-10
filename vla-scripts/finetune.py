@@ -13,7 +13,7 @@ import numpy as np
 from collections import deque
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Type, Union
+from typing import Dict, Optional, Tuple, Type, Union, List
 
 import draccus
 import torch
@@ -80,11 +80,11 @@ class FinetuneConfig:
     seed: int = 42
     disentangle: str = "none"
     with_memory: bool = False
-    static_ratio: float = 0.0
+    static_ratio: Union[float, List[float]] = 0.0
     invswap_ratio: float = 1.0
     use_contrastive: bool = False
     use_cache_gate: bool = False
-    backward_window_size: int = 10
+    backward_window_size: Union[int, List[int]] = 10
     train_gate_only: bool = False
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
@@ -372,10 +372,10 @@ def run_forward_pass(
             timestep=batch.get("timestep", None),
         )
     
-    if gate_logits_list is not None and getattr(output, "gate_logits", None) is not None:
-        timestep = batch.get("timestep", None)
-        for t, p in zip(timestep.cpu().numpy(), output.gate_logits.softmax(-1)[:, 1].float().detach().cpu().numpy()):
-            gate_logits_list.append((t[1]-t[0], p))
+    # if gate_logits_list is not None and getattr(output, "gate_logits", None) is not None:
+    #     timestep = batch.get("timestep", None)
+    #     for t, p in zip(timestep.cpu().numpy(), output.gate_logits.softmax(-1)[:, 1].float().detach().cpu().numpy()):
+    #         gate_logits_list.append((t[1]-t[0], p))
 
     # Get action masks needed for logging
     ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
@@ -481,7 +481,13 @@ def run_forward_pass(
             static_acc = (static['indices'] == other_static['indices']).float().mean(1)
             metrics['static_acc'] = static_acc.mean().item()
         else:
-            static_mae = (torch.abs(static['features'] - other_static['features'])).mean()
+            if isinstance(static, list) or isinstance(static, tuple):
+                static_mae = 0.0
+                for _other_static in other_static:
+                    for cs, os in zip(static, _other_static):
+                        static_mae += (torch.abs(cs['features'] - os['features'])).mean() / len(other_static) / len(os)
+            else:
+                static_mae = (torch.abs(static['features'] - other_static['features'])).mean()
             metrics['static_mae'] = static_mae.item()
 
         if "dists" in static:
@@ -502,14 +508,24 @@ def run_forward_pass(
                 metrics['nce_loss'] = nce_loss.item()
                 loss = loss + 0.1 * nce_loss
             else:
-                static_features, other_static_features = map(lambda x: x.transpose(0, 1), vector_normalize(static['features'], other_static['features'])) # (N, B, F)
-                positive_logits = (static_features * other_static_features).sum(-1) # (N, B)
-                pair_logits = static_features @ static_features.transpose(1, 2) #(N, B, B)
-                pair_logits.diagonal(dim1=1, dim2=2).copy_(positive_logits) # (N, B, B)
-                nce_loss = F.cross_entropy(
-                    pair_logits.reshape(-1, pair_logits.size(-1)), # (N*B, B)
-                    torch.arange(pair_logits.size(-1), device=pair_logits.device).repeat(pair_logits.size(0)), # (N*B)
-                )
+                def get_nce_loss(features1, features2):
+                    static_features, other_static_features = map(lambda x: x.transpose(0, 1), vector_normalize(features1, features2)) # (N, B, F)
+                    positive_logits = (static_features * other_static_features).sum(-1) # (N, B)
+                    pair_logits = static_features @ static_features.transpose(1, 2) #(N, B, B)
+                    pair_logits.diagonal(dim1=1, dim2=2).copy_(positive_logits) # (N, B, B)
+                    nce_loss = F.cross_entropy(
+                        pair_logits.reshape(-1, pair_logits.size(-1)), # (N*B, B)
+                        torch.arange(pair_logits.size(-1), device=pair_logits.device).repeat(pair_logits.size(0)), # (N*B)
+                    )
+                    return nce_loss
+                
+                if isinstance(static, list) or isinstance(static, tuple):
+                    nce_loss = 0.0
+                    for _other_static in other_static:
+                        for cs, os in zip(static, _other_static):
+                            nce_loss += get_nce_loss(cs['features'], os['features']) / len(other_static) / len(os)
+                else:
+                    nce_loss = get_nce_loss(static['features'], other_static['features'])
                 metrics['nce_loss'] = nce_loss.item()
                 loss = loss + 0.1 * nce_loss
 
@@ -517,16 +533,32 @@ def run_forward_pass(
             use_prior_reg = True
             if use_prior_reg:
                 timestep = batch['timestep'].to(device_id)
-                time_delta = timestep[:, 1] - timestep[:, 0]  # (B,)
-                gt_prob = torch.exp(-time_delta.float() / 10)  # (B,)
-                gt_prob = torch.stack([gt_prob, 1 - gt_prob], dim=-1)  # (B, 2)
-                gate_logits = output.gate_logits.to(loss.dtype)
-                log_gate_prob = gate_logits.log_softmax(-1)
-                prob_reg_loss = - (gt_prob * log_gate_prob).sum(-1).mean()
+                if isinstance(static, list) or isinstance(static, tuple):
+                    prob_reg_loss = 0.0
+                    for i in range(len(other_static)):
+                        time_delta = timestep[:, -1] - timestep[:, i]  # (B,)
+                        gt_prob = torch.exp(-time_delta.float() / 10)  # (B,)
+                        gt_prob = torch.stack([gt_prob, 1 - gt_prob], dim=-1)  # (B, 2)
+                        gate_logits = output.gate_logits[i].to(loss.dtype)
+                        log_gate_prob = gate_logits.log_softmax(-1)
+                        prob_reg_loss += - (gt_prob * log_gate_prob).sum(-1).mean() / len(other_static)
+                else:
+                    time_delta = timestep[:, 1] - timestep[:, 0]  # (B,)
+                    gt_prob = torch.exp(-time_delta.float() / 10)  # (B,)
+                    gt_prob = torch.stack([gt_prob, 1 - gt_prob], dim=-1)  # (B, 2)
+                    gate_logits = output.gate_logits.to(loss.dtype)
+                    log_gate_prob = gate_logits.log_softmax(-1)
+                    prob_reg_loss = - (gt_prob * log_gate_prob).sum(-1).mean()
                 metrics['prob_reg_loss'] = prob_reg_loss.detach()
                 loss = loss + 0.1 * prob_reg_loss
 
-                z_loss = torch.log(torch.exp(gate_logits).sum(-1)).pow(2).mean()
+                if isinstance(static, list) or isinstance(static, tuple):
+                    z_loss = 0.0
+                    for i in range(len(other_static)):
+                        gate_logits = output.gate_logits[i].to(loss.dtype)
+                        z_loss += torch.log(torch.exp(gate_logits).sum(-1)).pow(2).mean() / len(other_static)
+                else:
+                    z_loss = torch.log(torch.exp(output.gate_logits).sum(-1)).pow(2).mean()
                 metrics['z_loss'] = z_loss.detach()
                 loss = loss + 0.0001 * max(z_loss, 0.0)
             else:
@@ -1204,7 +1236,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
-        disentangle=cfg.static_ratio > 0.0,
+        disentangle=isinstance(cfg.static_ratio, list) or cfg.static_ratio > 0.0,
         with_memory=cfg.with_memory,
         skip_step=resume_step and (resume_step * cfg.batch_size * cfg.grad_accumulation_steps * distributed_state.num_processes),
         backward_window_size=cfg.backward_window_size,
