@@ -200,7 +200,7 @@ class CacheGateImage(nn.Module):
                     gate = gumbel_softmax(logits, hard=True, use_uniform=True)
                 else:
                     gate_temp = gumbel_softmax(logits, hard=True, use_uniform=True)
-                    use_curr = gate[:, 1:2].bool()
+                    use_curr = (gate[:, 1:2] > 0.5)
                     gate = gate * use_curr + gate_temp * (~use_curr)
                 all_gate.append(gate)
                 all_logits.append(logits)
