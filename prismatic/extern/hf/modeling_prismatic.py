@@ -41,6 +41,7 @@ from .configuration_prismatic import OpenVLAConfig, PrismaticConfig
 from vla_modules.utils import patch_projector
 # Set up logger
 logger = logging.getLogger(__name__)
+from prismatic.extern.hf.modeling_llama_fastv import LlamaForCausalLMFastV
 
 
 # === Utility Functions for Monkey-Patching ===
@@ -411,7 +412,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         )
 
         # Instantiate LLM Backbone
-        self.language_model = AutoModelForCausalLM.from_config(
+        self.language_model = LlamaForCausalLMFastV._from_config(
             config.text_config, attn_implementation=config._attn_implementation
         )
         self.vocab_size = config.text_config.vocab_size
@@ -1057,7 +1058,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         action_head=None,
-        cache=None
+        cache=None,
+        cache_length=0,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
@@ -1071,7 +1073,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_token_mask = torch.cat([all_actions_mask[:, :1], torch.zeros(projected_patch_embeddings.size(0), projected_patch_embeddings.size(1), 1, device=all_actions_mask.device, dtype=all_actions_mask.dtype), all_actions_mask[:, 1:]], dim=1)
         # Forward pass through language model
         if cache is not None:
-            cache_length = cache[0][0].shape[2]
             multimodal_embeddings = multimodal_embeddings[:, cache_length:]
             action_token_mask = action_token_mask[:, cache_length:]
         language_model_output = self.language_model(
@@ -1096,7 +1097,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
             actions_hidden_states = last_hidden_states[
                 :,
-                NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+                -ACTION_DIM * NUM_ACTIONS_CHUNK-2:-2,
                 :,
             ]  # (B, act_chunk_len, D)
 
@@ -1206,11 +1207,22 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             length = self.n_static_tokens
             if isinstance(length, list):
                 length = sum(length)
-        past_key_values = tuple(
-            (k_cache[:, :, :length, :], v_cache[:, :, :length, :])
-            for k_cache, v_cache in past_key_values
-        )
-        return past_key_values
+        if len(past_key_values) == 2:
+            new_past_key_values = tuple()
+            keep_indexs, past_key_values = past_key_values
+            for k_cache, v_cache in past_key_values:
+                if k_cache.size(-2) != keep_indexs.size(0):
+                    new_past_key_values = new_past_key_values + ((k_cache[:, :, :length, :], v_cache[:, :, :length, :]), )
+                else:
+                    mask = keep_indexs < length
+                    new_past_key_values = new_past_key_values + ((k_cache[:, :, mask, :], v_cache[:, :, mask, :]), )
+            return (keep_indexs, new_past_key_values)
+        else:
+            past_key_values = tuple(
+                (k_cache[:, :, :length, :], v_cache[:, :, :length, :])
+                for k_cache, v_cache in past_key_values
+            )
+            return past_key_values
 
     def predict_action(
         self,
@@ -1294,6 +1306,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                         self.time_gaps = [[] for _ in range(len(self.config.static_ratio))]
                     for time_gaps in self.time_gaps:
                         time_gaps.append(0)
+                cache_length = 0
             else:
                 other_image_features, other_static, other_dynamic = map(list, zip(*self.history_image))
                 _, gate_logits = self.cache_gate(
@@ -1310,8 +1323,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     assert len(recache_prob) == 2 #FIXME: only support 2 images now
                     for i, recache_p in enumerate(recache_prob):
                         if i == 0:
-                            if recache_p > 0.9:
+                            if recache_p > 0.0:
                                 cache = None
+                                cache_length = 0
                                 self.history_image = (projected_patch_embeddings, projected_patch_embeddings)
                                 for time_gaps in self.time_gaps:
                                     time_gaps.append(0)
@@ -1320,12 +1334,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                                 self.time_gaps[0][-1] += 1
                         else:
                             if recache_p > 0.7:
+                                cache_length = self.n_static_tokens[0]
                                 cache = self.truncate_cache(cache, length=self.n_static_tokens[i-1])
                                 self.history_image = (self.history_image[0], projected_patch_embeddings)
                                 self.time_gaps[i].append(0)
                             else:
                                 self.time_gaps[i][-1] += 1
+                                cache_length = 256
                 else:
+                    raise
                     recache_prob = gate_logits.softmax(dim=-1)[:, 1].item() # batch size must be 1
                     if not hasattr(self, 'recache_probs'):
                         self.recache_probs = []
@@ -1352,7 +1369,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
 
         # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
-        NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
+        NUM_PATCHES = self.vision_backbone.get_num_patches() // 2 * self.vision_backbone.get_num_images_in_input()
         if use_proprio:
             NUM_PATCHES += 1
         if use_diffusion:
@@ -1390,6 +1407,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PROMPT_TOKENS,
                 action_head,
                 cache=cache,
+                cache_length=cache_length,
             )
 
         # Unnormalize predicted actions
