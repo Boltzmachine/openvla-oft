@@ -6,12 +6,12 @@ that represents a single trajectory, meaning each tensor has the same leading di
 """
 
 import logging
-from typing import Dict
+from typing import Dict, Union, List
 
 import tensorflow as tf
 
 
-def chunk_act_obs(traj: Dict, window_size: int, backward_observation_window_size: int, future_action_window_size: int = 0) -> Dict:
+def chunk_act_obs(traj: Dict, window_size: int, backward_observation_window_size: Union[int, List[int]], future_action_window_size: int = 0) -> Dict:
     """
     Chunks actions and observations into the given window_size.
 
@@ -26,15 +26,25 @@ def chunk_act_obs(traj: Dict, window_size: int, backward_observation_window_size
     action_dim = traj["action"].shape[-1]
     effective_traj_len = traj_len - future_action_window_size
 
-    if backward_observation_window_size > 0:
-        if backward_observation_window_size < 1000:
-            backward_observation_window_size = random_int = tf.random.uniform(shape=[], minval=1, maxval=11, dtype=tf.int32)
-        chunk_indices = tf.broadcast_to(tf.concat([[-backward_observation_window_size], tf.range(-window_size + 1, 1)], axis=0), [effective_traj_len, window_size+1]) + tf.broadcast_to(
-        tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size+1]
-        )
-    else:    
+    if backward_observation_window_size == 0:
         chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [effective_traj_len, window_size]) + tf.broadcast_to(
             tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size]
+        )
+    else:
+        if isinstance(backward_observation_window_size, int):
+            backward_observation_window_size = tf.random.uniform(shape=[], minval=1, maxval=backward_observation_window_size+1, dtype=tf.int32)
+            bws = [-backward_observation_window_size]
+        elif isinstance(backward_observation_window_size, list):
+            bws = []
+            minval = 1
+            for bw_ws in backward_observation_window_size[::-1]:
+                bw = tf.random.uniform(shape=[], minval=minval, maxval=bw_ws+1, dtype=tf.int32)
+                bws.insert(0, -bw)
+                minval = bw + 1
+        else:
+            raise ValueError("backward_observation_window_size must be an int or a list of ints")
+        chunk_indices = tf.broadcast_to(tf.concat([bws, tf.range(-window_size + 1, 1)], axis=0), [effective_traj_len, window_size+len(bws)]) + tf.broadcast_to(
+            tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size+len(bws)]
         )
 
     action_chunk_indices = tf.broadcast_to(

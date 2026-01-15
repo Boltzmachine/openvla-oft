@@ -146,6 +146,7 @@ class PaddedCollatorForActionPrediction:
         else:
             proprio = None
 
+        timestep = torch.tensor([instance["timestep"] for instance in instances], dtype=torch.long)
         output = dict(
             pixel_values=pixel_values,
             other_pixel_values=other_pixel_values,
@@ -154,6 +155,7 @@ class PaddedCollatorForActionPrediction:
             attention_mask=attention_mask,
             labels=labels,
             actions=actions,
+            timestep=timestep
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names

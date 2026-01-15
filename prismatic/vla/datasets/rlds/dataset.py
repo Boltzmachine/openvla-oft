@@ -334,6 +334,7 @@ def apply_trajectory_transforms(
             ),
             num_parallel_calls,
         )
+    dataset = dataset.filter(lambda x: tf.shape(x["action"])[0] >= future_action_window_size)
 
     # chunks observations and actions, giving them a new axis at index 1 of size `window_size` and
     # `window_size + future_action_window_size`, respectively

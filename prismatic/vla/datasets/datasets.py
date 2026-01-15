@@ -7,7 +7,7 @@ format to OpenVLA, IterableDataset shim.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Type, Optional
+from typing import Any, Dict, Tuple, Type, Optional, List, Union
 
 import numpy as np
 import random
@@ -39,10 +39,9 @@ class RLDSBatchTransform:
         dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
         if len(rlds_batch["observation"]["image_primary"]) > 1:
-            selected_index = random.randint(0, len(rlds_batch["observation"]["image_primary"]) - 2)
-            other_img = Image.fromarray(rlds_batch["observation"]["image_primary"][selected_index])
+            other_imgs = [Image.fromarray(rlds_batch["observation"]["image_primary"][selected_index]) for selected_index in range(len(rlds_batch["observation"]["image_primary"]) - 1)]
         else:
-            other_img = None
+            other_imgs = None
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
         actions = rlds_batch["action"]
 
@@ -73,8 +72,8 @@ class RLDSBatchTransform:
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
         pixel_values = self.image_transform(img)
-        if other_img is not None:
-            other_pixel_values = self.image_transform(other_img)
+        if other_imgs is not None:
+            other_pixel_values = torch.stack([self.image_transform(other_img) for other_img in other_imgs]).squeeze(0)
         else:
             other_pixel_values = None
 
@@ -83,7 +82,7 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return_dict = dict(pixel_values=pixel_values, other_pixel_values=other_pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+        return_dict = dict(pixel_values=pixel_values, other_pixel_values=other_pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions, timestep=rlds_batch["observation"]['timestep'])
 
         # Add additional inputs
         if self.use_wrist_image:
@@ -114,6 +113,7 @@ class RLDSDataset(IterableDataset):
         disentangle: bool = False,
         with_memory: bool = False,
         skip_step: Optional[int] = None,
+        backward_window_size: Union[int, List[int]] = 0,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -146,7 +146,7 @@ class RLDSDataset(IterableDataset):
             backward_observation_window_size = 100000000
         elif self.disentangle:
             assert not self.with_memory
-            backward_observation_window_size = 10
+            backward_observation_window_size = backward_window_size
         else:
             backward_observation_window_size = 0
         rlds_config = dict(
