@@ -1311,7 +1311,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=kwargs.get("other_pixel_values", None) is not None, output_attentions=True)
+        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=True, output_attentions=True)
         if isinstance(projected_patch_embeddings, tuple):
             image_features, static, dynamic = projected_patch_embeddings
         

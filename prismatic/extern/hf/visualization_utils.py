@@ -127,13 +127,26 @@ def visualize_attention(vis_buffer, pixel_values, attentions, discard_ratio, hea
             token_mask = cv2.resize(vis_mask[n_token], (np_img.shape[1], np_img.shape[0]))
             token_mask_img = show_mask_on_image(np_img, token_mask)
             write_to(f"{ind}/tokens/token_{n_token}", token_mask_img, vis_buffer)
+        if isinstance(n_static_tokens, float):
+            static_mask = cv2.resize(vis_mask[:n_static_tokens].mean(0), (np_img.shape[1], np_img.shape[0]))
+            dynamic_mask = cv2.resize(vis_mask[n_static_tokens:].mean(0), (np_img.shape[1], np_img.shape[0]))
+            static_mask = show_mask_on_image(np_img, static_mask)
+            dynamic_mask = show_mask_on_image(np_img, dynamic_mask)
 
-        static_mask = cv2.resize(vis_mask[:n_static_tokens].mean(0), (np_img.shape[1], np_img.shape[0]))
-        dynamic_mask = cv2.resize(vis_mask[n_static_tokens:].mean(0), (np_img.shape[1], np_img.shape[0]))
-        static_mask = show_mask_on_image(np_img, static_mask)
-        dynamic_mask = show_mask_on_image(np_img, dynamic_mask)
-
-        img_name = "none"
-        write_to(f"{ind}/input", np_img, vis_buffer)
-        write_to(f"{ind}/{img_name}_static", static_mask, vis_buffer)
-        write_to(f"{ind}/{img_name}_dynamic", dynamic_mask, vis_buffer)
+            img_name = "none"
+            write_to(f"{ind}/input", np_img, vis_buffer)
+            write_to(f"{ind}/{img_name}_static", static_mask, vis_buffer)
+            write_to(f"{ind}/{img_name}_dynamic", dynamic_mask, vis_buffer)
+        elif isinstance(n_static_tokens, list):
+            img_name = "none"
+            write_to(f"{ind}/input", np_img, vis_buffer)
+            
+            static_cum = 0
+            for i, _n_static_tokens in enumerate(n_static_tokens):
+                static_mask = cv2.resize(vis_mask[static_cum:static_cum+_n_static_tokens].mean(0), (np_img.shape[1], np_img.shape[0]))
+                static_cum += _n_static_tokens
+                static_mask = show_mask_on_image(np_img, static_mask)
+                write_to(f"{ind}/{img_name}_static{i}", static_mask, vis_buffer)
+            dynamic_mask = cv2.resize(vis_mask[static_cum:].mean(0), (np_img.shape[1], np_img.shape[0]))
+            dynamic_mask = show_mask_on_image(np_img, dynamic_mask)
+            write_to(f"{ind}/{img_name}_dynamic", dynamic_mask, vis_buffer)
