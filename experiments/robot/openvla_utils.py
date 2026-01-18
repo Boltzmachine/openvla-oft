@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from huggingface_hub import HfApi, snapshot_download
 
 import json_numpy
 import numpy as np
@@ -267,20 +268,26 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     # actually go into effect
     # If loading a pretrained checkpoint from Hugging Face Hub, we just assume that the policy
     # will be used as is, with its original modeling logic
-    if not model_is_on_hf_hub(cfg.pretrained_checkpoint):
+    vla_path = "openvla/openvla-7b"
+    if model_is_on_hf_hub(vla_path):
+        # Download model directly from Hugging Face Hub
+        vla_download_path = snapshot_download(repo_id=vla_path)
+        # Overwrite VLA path
+        vla_path = vla_download_path
+    elif not model_is_on_hf_hub(vla_path):
         # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
         AutoConfig.register("openvla", OpenVLAConfig)
         AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
         AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-        # Update config.json and sync model files
-        update_auto_map(cfg.pretrained_checkpoint)
-        check_model_logic_mismatch(cfg.pretrained_checkpoint)
+    # Update config.json and sync model files
+    update_auto_map(vla_path)
+    check_model_logic_mismatch(vla_path)
 
     # Load the model
     vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.pretrained_checkpoint,
+        vla_path,
         # attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
@@ -288,6 +295,12 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+    from vla_modules.utils import postset_model
+    from peft import LoraConfig, PeftModel
+    train_cfg = json.load(open(os.path.join(cfg.pretrained_checkpoint, "finetune_config.json"), "r"))
+    postset_model(vla, train_cfg)
+    vla = PeftModel.from_pretrained(vla, Path(cfg.pretrained_checkpoint) / "lora_adapter", torch_dtype=torch.bfloat16)
+    vla = vla.merge_and_unload()
 
     # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
     if cfg.use_film:

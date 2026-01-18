@@ -29,7 +29,7 @@ def patch_projector(self, static_ratio):
 
     if self.config.use_cache_gate:
         from vla_modules import CacheGate, CacheGateImage, CacheGateSimple
-        self.cache_gate = CacheGateImage(4096, static_ratio=static_ratio).to(self.language_model.device)
+        self.cache_gate = CacheGateImage(4096, static_ratio=static_ratio).to(self.language_model.device).to(self.language_model.dtype)
 
     self._is_patched = True
 
