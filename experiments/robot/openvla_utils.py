@@ -258,6 +258,8 @@ def initialize_vla(cfg):
         model_class = MemoryVLAForActionPrediction
     elif cfg.baseline == "contextvla":
         model_class = ContextVLAForActionPrediction
+    elif cfg.baseline == "tracevla":
+        model_class = OpenVLAForActionPrediction
     elif cfg.baseline == "none":
         model_class = OpenVLAForActionPrediction
     else:

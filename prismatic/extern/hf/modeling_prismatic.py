@@ -1259,7 +1259,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     static['features'] = static['features'].view(pixel_values.size(0), self.vision_backbone.num_images_in_input, -1, static['features'].shape[-1]).mean(dim=1)
                 else:
                     static['features'] = static['features'].view(pixel_values.size(0), self.vision_backbone.num_images_in_input, -1, static['features'].shape[-1])[:, -1]
-                projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+            projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
             
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None

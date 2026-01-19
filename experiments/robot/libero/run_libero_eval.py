@@ -51,7 +51,7 @@ from experiments.robot.robot_utils import (
     set_seed_everywhere,
 )
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK
-
+from prismatic.extern.hf.modeling_tracevla import TraceProcessor
 
 # Define task suite constants
 class TaskSuite(str, Enum):
@@ -194,6 +194,9 @@ def check_unnorm_key(cfg: GenerateConfig, model) -> None:
     if unnorm_key not in model.norm_stats and f"{unnorm_key}_no_noops" in model.norm_stats:
         unnorm_key = f"{unnorm_key}_no_noops"
 
+    if unnorm_key not in model.norm_stats and f"{unnorm_key}_trace" in model.norm_stats:
+        unnorm_key = f"{unnorm_key}_trace"
+
     assert unnorm_key in model.norm_stats, f"Action un-norm key {unnorm_key} not found in VLA `norm_stats`!"
 
     # Set the unnorm_key in cfg
@@ -248,7 +251,7 @@ def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=
         return initial_states, None
 
 
-def prepare_observation(obs, resize_size):
+def prepare_observation(obs, resize_size, trace_processor=None):
     """Prepare observation for policy input."""
     # Get preprocessed images
     img = get_libero_image(obs)
@@ -257,6 +260,10 @@ def prepare_observation(obs, resize_size):
     # Resize images to size expected by model
     img_resized = resize_image_for_policy(img, resize_size)
     wrist_img_resized = resize_image_for_policy(wrist_img, resize_size)
+
+    if trace_processor is not None:
+        img_resized, has_trace = trace_processors.process_image(img_resized)
+        import ipdb; ipdb.set_trace()
 
     # Prepare observations dict
     observation = {
@@ -304,6 +311,7 @@ def run_episode(
     initial_state=None,
     log_file=None,
     episode_idx: int = 0,
+    trace_processor=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -345,6 +353,8 @@ def run_episode(
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
     max_cache_steps = 2 if model.config.static_ratio > 0 else 0
     cache_steps = 0
+    if trace_processor is not None:
+        trace_processor.reset()
 
     # Run episode
     cache = None
@@ -494,6 +504,8 @@ def run_task(
     # Initialize environment and get task description
     env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
 
+    trace_processor = TraceProcessor("co-tracker/checkpoints/scaled_offline.pth", redraw_frequency=20) if cfg.baseline == 'tracevla' else None
+
     # Start episodes
     task_episodes, task_successes = 0, 0
     if "stove" in cfg.task_suite_name:
@@ -535,7 +547,8 @@ def run_task(
             noisy_action_projector,
             initial_state,
             log_file,
-            episode_idx
+            episode_idx,
+            trace_processor=trace_processor,
         )
 
         # Update counters
