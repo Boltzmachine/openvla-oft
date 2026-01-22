@@ -118,7 +118,8 @@ def write_to(name, img, buffer=None):
     else:
         buffer[name].append(img)
 
-def visualize_attention(vis_buffer, pixel_values, attentions, discard_ratio, head_fusion, n_static_tokens, self_loop=True):
+
+def visualize_attention(global_ind, vis_buffer, pixel_values, attentions, discard_ratio, head_fusion, n_static_tokens, self_loop=True):
     vis_masks = rollout(attentions, discard_ratio=discard_ratio, head_fusion=head_fusion, self_loop=self_loop)
     for ind, (img, vis_mask) in enumerate(zip(pixel_values[:, :3], vis_masks)):
         pil_img = torchvision.transforms.functional.to_pil_image(img.float() * img.new_tensor([0.228515625, 0.2236328125, 0.224609375]).view(3, 1, 1) + img.new_tensor([0.484375, 0.455078125, 0.40625]).view(3, 1, 1))
@@ -126,7 +127,7 @@ def visualize_attention(vis_buffer, pixel_values, attentions, discard_ratio, hea
         for n_token in range(vis_mask.shape[0]):
             token_mask = cv2.resize(vis_mask[n_token], (np_img.shape[1], np_img.shape[0]))
             token_mask_img = show_mask_on_image(np_img, token_mask)
-            write_to(f"{ind}/tokens/token_{n_token}", token_mask_img, vis_buffer)
+            write_to(f"{global_ind}/tokens/token_{n_token}", token_mask_img, vis_buffer)
         if isinstance(n_static_tokens, float):
             static_mask = cv2.resize(vis_mask[:n_static_tokens].mean(0), (np_img.shape[1], np_img.shape[0]))
             dynamic_mask = cv2.resize(vis_mask[n_static_tokens:].mean(0), (np_img.shape[1], np_img.shape[0]))
@@ -134,19 +135,19 @@ def visualize_attention(vis_buffer, pixel_values, attentions, discard_ratio, hea
             dynamic_mask = show_mask_on_image(np_img, dynamic_mask)
 
             img_name = "none"
-            write_to(f"{ind}/input", np_img, vis_buffer)
-            write_to(f"{ind}/{img_name}_static", static_mask, vis_buffer)
-            write_to(f"{ind}/{img_name}_dynamic", dynamic_mask, vis_buffer)
+            write_to(f"{global_ind}/input", np_img, vis_buffer)
+            write_to(f"{global_ind}/{img_name}_static", static_mask, vis_buffer)
+            write_to(f"{global_ind}/{img_name}_dynamic", dynamic_mask, vis_buffer)
         elif isinstance(n_static_tokens, list):
             img_name = "none"
-            write_to(f"{ind}/input", np_img, vis_buffer)
+            write_to(f"{global_ind}/input", np_img, vis_buffer)
             
             static_cum = 0
             for i, _n_static_tokens in enumerate(n_static_tokens):
                 static_mask = cv2.resize(vis_mask[static_cum:static_cum+_n_static_tokens].mean(0), (np_img.shape[1], np_img.shape[0]))
                 static_cum += _n_static_tokens
                 static_mask = show_mask_on_image(np_img, static_mask)
-                write_to(f"{ind}/{img_name}_static{i}", static_mask, vis_buffer)
+                write_to(f"{global_ind}/{img_name}_static{i}", static_mask, vis_buffer)
             dynamic_mask = cv2.resize(vis_mask[static_cum:].mean(0), (np_img.shape[1], np_img.shape[0]))
             dynamic_mask = show_mask_on_image(np_img, dynamic_mask)
-            write_to(f"{ind}/{img_name}_dynamic", dynamic_mask, vis_buffer)
+            write_to(f"{global_ind}/{img_name}_dynamic", dynamic_mask, vis_buffer)

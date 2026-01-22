@@ -329,7 +329,6 @@ def run_episode(
     # Run episode
     cache = None
     success = False
-    model.prepare_visualization()
     while t < max_steps + cfg.num_steps_wait:
         # Do nothing for the first few timesteps to let objects stabilize
         if t < cfg.num_steps_wait:
@@ -381,7 +380,6 @@ def run_episode(
 
     # except Exception as e:
     #     log_message(f"Episode error: {e}", log_file)
-    model.finalize_visualization()
     return success, replay_images
 
 
@@ -411,6 +409,7 @@ def run_task(
 
     # Start episodes
     task_episodes, task_successes = 0, 0
+    model.prepare_visualization(total_episodes)
     for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
         log_message(f"\nTask: {task_description}", log_file)
 
@@ -464,6 +463,9 @@ def run_task(
         log_message(f"Success: {success}", log_file)
         log_message(f"# episodes completed so far: {total_episodes}", log_file)
         log_message(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)", log_file)
+
+        break
+    model.finalize_visualization()
 
     # Log task results
     task_success_rate = float(task_successes) / float(task_episodes) if task_episodes > 0 else 0

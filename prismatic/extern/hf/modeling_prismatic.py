@@ -239,8 +239,9 @@ class PrismaticVisionBackbone(nn.Module):
         """
         self.num_images_in_input = num_images_in_input
 
-    def prepare_visualization(self):
+    def prepare_visualization(self, ind):
         from collections import defaultdict
+        self.vis_ind = ind
         self.vis_buffer = defaultdict(list)
 
     def finalize_visualization(self):
@@ -248,6 +249,8 @@ class PrismaticVisionBackbone(nn.Module):
         import imageio
         import os
         for key, images in self.vis_buffer.items():
+            if 'token' in key:
+                continue
             height, width, _ = images[0].shape
             video_path = f"visualizations/{key}.mp4"
             os.makedirs(os.path.dirname(video_path), exist_ok=True)
@@ -255,7 +258,8 @@ class PrismaticVisionBackbone(nn.Module):
             for img in images:
                 video_writer.append_data(img[:, :, ::-1])  # RGB to BGR
             video_writer.close()
-        exit()
+        # self.vis_buffer = defaultdict(list)
+        # exit()
 
     def forward(self, pixel_values: torch.Tensor, **kwargs) -> torch.Tensor:
         """
@@ -286,7 +290,7 @@ class PrismaticVisionBackbone(nn.Module):
                 attentions = torch.stack(attentions, dim=0).detach() #(L, B, num_heads, N, N)
                 attentions = attentions[-4:-3]
 
-                visualize_attention(self.vis_buffer, pixel_values, attentions, discard_ratio=0.9, head_fusion='max', n_static_tokens=kwargs['n_static_tokens'], self_loop=False)
+                visualize_attention(self.vis_ind, self.vis_buffer, pixel_values, attentions, discard_ratio=0.9, head_fusion='max', n_static_tokens=kwargs['n_static_tokens'], self_loop=False)
 
             if 'n_inject' in kwargs:
                 patches, patches_fused = self.featurizer(img, n_inject=kwargs['n_inject'], injected_embeddings=kwargs['injected_embeddings'][0]), self.fused_featurizer(img_fused, n_inject=kwargs['n_inject'], injected_embeddings=kwargs['injected_embeddings'][1])
@@ -474,8 +478,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
     def patch_projector(self, static_ratio):
         return patch_projector(self, static_ratio)
     
-    def prepare_visualization(self):
-        self.vision_backbone.prepare_visualization()
+    def prepare_visualization(self, ind):
+        self.vision_backbone.prepare_visualization(ind)
     
     def finalize_visualization(self):
         self.vision_backbone.finalize_visualization()
