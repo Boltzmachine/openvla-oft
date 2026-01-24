@@ -86,6 +86,7 @@ class GenerateConfig:
     #################################################################################################################
     # Model-specific parameters
     #################################################################################################################
+    baseline: str = "none"
     model_family: str = "openvla"                    # Model family
     pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
 
@@ -319,7 +320,7 @@ def run_episode(
     replay_images = []
     replay_observations = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
-    if model.config.use_cache_gate:
+    if getattr(model.config, "use_cache_gate", False):
         max_cache_steps = 1000000 # leave model to decide when to recache
         model.history_image = None
     else:
@@ -411,6 +412,8 @@ def run_task(
     # Start episodes
     task_episodes, task_successes = 0, 0
     for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+        if hasattr(model.vision_backbone, 'manager'):
+            model.vision_backbone.manager.reset_state()
         log_message(f"\nTask: {task_description}", log_file)
 
         # Handle initial state
@@ -492,8 +495,32 @@ def eval_libero(cfg: GenerateConfig) -> float:
     # Set random seed
     set_seed_everywhere(cfg.seed)
 
+
     # Initialize model and components
     model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
+
+    if cfg.baseline == "ttf":
+        from vla_modules.baseline_utils.aptube_manager import APTubeManager
+        manager = APTubeManager()
+        manager.configure(
+            aptube_enabled=True,
+            baseline_dino_gflops=158.0496,
+            baseline_siglip_gflops=210.9423,
+            patch_diff_threshold=0.1,
+            keyframe_interval=5,
+            smooth_fusion_enabled=False,
+            fusion_mode="attention",
+            semantic_shallow_layer=2,
+            semantic_threshold=0.5,
+            attention_layer_id=15,
+            attention_top_k=120,
+            visualize_attention=False,
+            visualization_save_dir=False,
+            visualization_interval=False,
+            attention_mode="text",
+            use_multi_layer=False,   
+        )
+        model.vision_backbone.manager = manager
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)

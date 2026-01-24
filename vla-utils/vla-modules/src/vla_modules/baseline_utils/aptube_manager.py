@@ -210,7 +210,7 @@ class APTubeManager:
             if isinstance(pixel_values, dict):
                 return {k: v.detach().clone() for k, v in pixel_values.items()}
             else:
-                return pixel_values.detach.clone()
+                return pixel_values.detach().clone()
         if self.fusion_mode == "pixel":
             self.last_pixel_values = detach_pixel_values(pixel_values)
             self.last_vision_tokens = vision_tokens.detach().clone()
@@ -403,38 +403,38 @@ class APTubeManager:
         Returns:
             Tuple of recompute masks for DINO and SigLIP
         """
-        try:
-            # Get pixel-based recompute mask (True = dynamic, False = static)
-            pixel_recompute_dino, pixel_recompute_siglip = self.get_pixel_recompute_mask(current_pixel_values)
-            pixel_dynamic_count = pixel_recompute_dino.sum().item()
+        # try:
+        # Get pixel-based recompute mask (True = dynamic, False = static)
+        pixel_recompute_dino, pixel_recompute_siglip = self.get_pixel_recompute_mask(current_pixel_values)
+        pixel_dynamic_count = pixel_recompute_dino.sum().item()
+        
+        # Get attention-based recompute mask (True = task-relevant, False = task-irrelevant)  
+        attention_recompute_dino, attention_recompute_siglip = self.get_attention_recompute_mask()
+        attention_relevant_count = attention_recompute_dino.sum().item()
+        
+        # Hybrid logic: recompute = pixel_recompute OR attention_recompute
+        # This means we reuse only patches that are BOTH static AND task-irrelevant
+        hybrid_recompute_dino = pixel_recompute_dino | attention_recompute_dino
+        hybrid_recompute_siglip = pixel_recompute_siglip | attention_recompute_siglip
+        
+        reuse_dino = (~hybrid_recompute_dino).sum().item()
+        reuse_siglip = (~hybrid_recompute_siglip).sum().item()
+        hybrid_reuse_rate = (reuse_dino + reuse_siglip) / 512 * 100
+        
+        # if self.step_counter % self.PRINT_INTERVAL == 0:
+        if True:
+            print(f"  DEBUG: Hybrid Analysis:")
+            print(f"    Pixel: {pixel_dynamic_count}/256 dynamic patches")
+            print(f"    Attention: {attention_relevant_count}/256 task-relevant patches")  
+            print(f"    Hybrid: DINO {reuse_dino}/256 reuse, SigLIP {reuse_siglip}/256 reuse")
+            print(f"    Combined reuse rate: {hybrid_reuse_rate:.1f}%")
+        
+        return hybrid_recompute_dino, hybrid_recompute_siglip
             
-            # Get attention-based recompute mask (True = task-relevant, False = task-irrelevant)  
-            attention_recompute_dino, attention_recompute_siglip = self.get_attention_recompute_mask()
-            attention_relevant_count = attention_recompute_dino.sum().item()
-            
-            # Hybrid logic: recompute = pixel_recompute OR attention_recompute
-            # This means we reuse only patches that are BOTH static AND task-irrelevant
-            hybrid_recompute_dino = pixel_recompute_dino | attention_recompute_dino
-            hybrid_recompute_siglip = pixel_recompute_siglip | attention_recompute_siglip
-            
-            reuse_dino = (~hybrid_recompute_dino).sum().item()
-            reuse_siglip = (~hybrid_recompute_siglip).sum().item()
-            hybrid_reuse_rate = (reuse_dino + reuse_siglip) / 512 * 100
-            
-            # if self.step_counter % self.PRINT_INTERVAL == 0:
-            if True:
-                print(f"  DEBUG: Hybrid Analysis:")
-                print(f"    Pixel: {pixel_dynamic_count}/256 dynamic patches")
-                print(f"    Attention: {attention_relevant_count}/256 task-relevant patches")  
-                print(f"    Hybrid: DINO {reuse_dino}/256 reuse, SigLIP {reuse_siglip}/256 reuse")
-                print(f"    Combined reuse rate: {hybrid_reuse_rate:.1f}%")
-            
-            return hybrid_recompute_dino, hybrid_recompute_siglip
-            
-        except Exception as e:
-            print(f"  DEBUG: Hybrid fusion failed: {e}, fallback to pixel-based fusion")
-            # Fallback to pixel-based fusion
-            return self.get_pixel_recompute_mask(current_pixel_values)
+        # except Exception as e:
+        #     print(f"  DEBUG: Hybrid fusion failed: {e}, fallback to pixel-based fusion")
+        #     # Fallback to pixel-based fusion
+        #     return self.get_pixel_recompute_mask(current_pixel_values)
     
     
     def get_pixel_diff_values_for_visualization(self) -> Optional[torch.Tensor]:

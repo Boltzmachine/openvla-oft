@@ -7,7 +7,7 @@ def postset_model(vla, cfg):
     vla.config.invswap_ratio = cfg.invswap_ratio
     vla.config.static_ratio = cfg.static_ratio
     vla.config.disentangle_method = cfg.disentangle
-    vla.config.use_cache_gate = cfg.use_cache_gate
+    vla.config.use_cache_gate = getattr(cfg, "use_cache_gate", False)
     vla.config.backward_window_size = cfg.backward_window_size
     vla.patch_projector(cfg.static_ratio)
 
