@@ -253,6 +253,8 @@ def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.modeling_memoryvla import MemoryVLAForActionPrediction
 from prismatic.extern.hf.modeling_contextvla import ContextVLAForActionPrediction
+from prismatic.extern.hf.modeling_prismatic_ttf import OpenVLAForActionPredictionTTF
+
 def initialize_vla(cfg):
     if cfg.baseline == "memoryvla":
         model_class = MemoryVLAForActionPrediction
@@ -260,6 +262,8 @@ def initialize_vla(cfg):
         model_class = ContextVLAForActionPrediction
     elif cfg.baseline == "tracevla":
         model_class = OpenVLAForActionPrediction
+    elif cfg.baseline == "ttf":
+        model_class = OpenVLAForActionPredictionTTF
     elif cfg.baseline == "none":
         model_class = OpenVLAForActionPrediction
     else:

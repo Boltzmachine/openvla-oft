@@ -52,6 +52,7 @@ from experiments.robot.robot_utils import (
 )
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK
 from prismatic.extern.hf.modeling_tracevla import TraceProcessor
+from vla_modules.baseline_utils.aptube_manager import APTubeManager
 
 # Define task suite constants
 class TaskSuite(str, Enum):
@@ -381,7 +382,10 @@ def run_episode(
     if "stove" in cfg.task_suite_name:
         cook_count = 0
         ever_moved = False
-        
+    
+    if cfg.baseline == 'ttf':
+        model.vision_backbone.manager.reset_state()
+
     while t < max_steps:
         # Do nothing for the first few timesteps to let objects stabilize
         if need_wait(cfg.task_suite_name, env, t, cfg.num_steps_wait):
@@ -626,6 +630,28 @@ def eval_libero(cfg: GenerateConfig) -> float:
     num_tasks = task_suite.n_tasks
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
+
+    if cfg.baseline == "ttf":
+        manager = APTubeManager()
+        manager.configure(
+            aptube_enabled=True,
+            baseline_dino_gflops=158.0496,
+            baseline_siglip_gflops=210.9423,
+            patch_diff_threshold=0.1,
+            keyframe_interval=5,
+            smooth_fusion_enabled=False,
+            fusion_mode="attention",
+            semantic_shallow_layer=2,
+            semantic_threshold=0.5,
+            attention_layer_id=15,
+            attention_top_k=120,
+            visualize_attention=False,
+            visualization_save_dir=False,
+            visualization_interval=False,
+            attention_mode="text",
+            use_multi_layer=False,   
+        )
+        model.vision_backbone.manager = manager
 
     # Start evaluation
     total_episodes, total_successes, total_breakdown = 0, 0, defaultdict(list)
