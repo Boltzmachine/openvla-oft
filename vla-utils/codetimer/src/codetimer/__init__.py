@@ -176,6 +176,35 @@ def squeeze_output(output):
             raise NotImplementedError(f"Unknown output key: {key}")
     return output
                 
-                
-        
             
+def break_back(time_gaps: list):
+    res = []
+    for i in time_gaps:
+        res.append(1)
+        for _ in range(i):
+            res.append(0)
+    return res
+
+
+def calculate_flops(time_gaps_0, time_gaps_1):
+    total = 0
+    reduced = 0
+    assert len(time_gaps_0) == len(time_gaps_1)
+    for time_gap_0, time_gap_1 in zip(time_gaps_0, time_gaps_1):
+        if time_gap_0 == 1:
+            assert time_gap_1 == 1
+        total += 405.50 + 57.96
+        reduced += 405.50 + 57.96
+
+        if time_gap_0 == 1 and time_gap_1 == 1:
+            total += 3726.64
+            reduced += 3726.64
+        elif time_gap_0 == 0 and time_gap_1 == 1:
+            total += 3726.64
+            reduced += 1969.04
+        elif time_gap_0 == 0 and time_gap_1 == 0:
+            total += 3726.64
+            reduced += 555.03
+
+
+    return reduced, total

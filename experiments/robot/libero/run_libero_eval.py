@@ -323,8 +323,12 @@ def run_episode(
     if getattr(model.config, "use_cache_gate", False):
         max_cache_steps = 1000000 # leave model to decide when to recache
         model.history_image = None
+    if cfg.baseline == "vlacache":
+        max_cache_steps = 10000000
+    elif cfg.baseline == "base":
+        max_cache_steps = 0
     else:
-        max_cache_steps = 3 if model.config.static_ratio > 0 else 0
+        max_cache_steps = 0
     cache_steps = 0
 
     # Run episode
@@ -343,9 +347,9 @@ def run_episode(
 
         # If action queue is empty, requery model
         if len(action_queue) == 0:
-            # history_index = -1 if cache is None else -17
+            # history_index = -1 if cache is None else -9
             # observation = {'full_image': get_bounded_from_index(replay_observations, history_index)['full_image']}
-            # history_image = get_bounded_from_index(replay_observations, history_index)['full_image']
+            history_image = get_bounded_from_index(replay_observations, -9)['full_image'] if cfg.baseline == 'vlacache' else None
             # Query model to get action
             actions, cache = get_action(
                 cfg,
@@ -357,7 +361,7 @@ def run_episode(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 use_film=cfg.use_film,
-                # history_image=model.history_image,
+                history_image=history_image,
                 cache=cache,
             )
             action_queue.extend(actions)
@@ -412,8 +416,13 @@ def run_task(
     # Start episodes
     task_episodes, task_successes = 0, 0
     for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
-        if hasattr(model.vision_backbone, 'manager'):
+        if cfg.baseline == "ttf":
             model.vision_backbone.manager.reset_state()
+        elif cfg.baseline == "flashvla":
+            from prismatic.extern.hf.modeling_prismatic_flashvla import FlashMemory
+            model.flash_memory = FlashMemory()
+            model.time_gaps = []
+
         log_message(f"\nTask: {task_description}", log_file)
 
         # Handle initial state
@@ -513,7 +522,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
             semantic_shallow_layer=2,
             semantic_threshold=0.5,
             attention_layer_id=15,
-            attention_top_k=120,
+            attention_top_k=240,
             visualize_attention=False,
             visualization_save_dir=False,
             visualization_interval=False,
@@ -563,7 +572,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Total successes: {total_successes}", log_file)
     log_message(f"Overall success rate: {final_success_rate:.4f} ({final_success_rate * 100:.1f}%)", log_file)
     
-    results_file.write(f"{cfg.pretrained_checkpoint}\t{final_success_rate:.4f}\n")
+    results_file.write(f"{cfg.baseline}\t{cfg.pretrained_checkpoint}\t{final_success_rate:.4f}\n")
     results_file.close()
     # Log to wandb if enabled
     if cfg.use_wandb:

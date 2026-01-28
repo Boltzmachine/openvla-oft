@@ -20,8 +20,6 @@ import transformers
 from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
-import random
-from vla_modules import DisentangleAdapter, ActionPredictor, AttentionPooling
 
 from prismatic.training.train_utils import (
     get_current_action_mask,
@@ -38,7 +36,7 @@ from prismatic.vla.constants import (
 )
 
 from .configuration_prismatic import OpenVLAConfig, PrismaticConfig
-from vla_modules.utils import patch_projector
+
 # Set up logger
 logger = logging.getLogger(__name__)
 
@@ -64,60 +62,6 @@ def ls_apply_patch(ls_module: LayerScale):
     ls_module.forward = _ls_new_forward.__get__(ls_module, LayerScale)
     del ls_module.gamma
 
-from typing import Sequence
-
-def _intermediate_layers(
-        self,
-        x: torch.Tensor,
-        n: Union[int, Sequence] = 1,
-        **kwargs
-):
-    outputs, num_blocks = [], len(self.blocks)
-    take_indices = set(range(num_blocks - n, num_blocks) if isinstance(n, int) else n)
-
-    # forward pass
-    x = self.patch_embed(x)
-    x = self._pos_embed(x)
-    x = self.patch_drop(x)
-    x = self.norm_pre(x)
-    for i, blk in enumerate(self.blocks):
-        if 'n_inject' in kwargs and kwargs['n_inject'] == i:
-            x[:, self.num_prefix_tokens:] += kwargs['injected_embeddings']
-        x = blk(x)
-        if i in take_indices:
-            outputs.append(x)
-
-    return outputs
-
-def get_intermediate_layers(
-        self,
-        x: torch.Tensor,
-        n: Union[int, Sequence] = 1,
-        reshape: bool = False,
-        return_prefix_tokens: bool = False,
-        norm: bool = False,
-        **kwargs,
-) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
-    """ Intermediate layer accessor (NOTE: This is a WIP experiment).
-    Inspired by DINO / DINOv2 interface
-    """
-    # take last n blocks if n is an int, if in is a sequence, select by matching indices
-    outputs = _intermediate_layers(self, x, n, **kwargs)
-    if norm:
-        outputs = [self.norm(out) for out in outputs]
-    prefix_tokens = [out[:, 0:self.num_prefix_tokens] for out in outputs]
-    outputs = [out[:, self.num_prefix_tokens:] for out in outputs]
-
-    if reshape:
-        grid_size = self.patch_embed.grid_size
-        outputs = [
-            out.reshape(x.shape[0], grid_size[0], grid_size[1], -1).permute(0, 3, 1, 2).contiguous()
-            for out in outputs
-        ]
-
-    if return_prefix_tokens:
-        return tuple(zip(outputs, prefix_tokens))
-    return tuple(outputs)
 
 # === Prismatic Vision Backbone (nn.Module) Definitions (w/ Fused Backbone Support) ===
 class PrismaticVisionBackbone(nn.Module):
@@ -190,7 +134,7 @@ class PrismaticVisionBackbone(nn.Module):
 
         # Monkey-patch the forward function to extract the second-to-last layer features
         num_blocks = len(featurizer.blocks)
-        featurizer.forward = unpack_tuple(partial(get_intermediate_layers.__get__(featurizer), n={num_blocks - 2}))
+        featurizer.forward = unpack_tuple(partial(featurizer.get_intermediate_layers, n={num_blocks - 2}))
 
         return featurizer
 
@@ -239,7 +183,7 @@ class PrismaticVisionBackbone(nn.Module):
         """
         self.num_images_in_input = num_images_in_input
 
-    def forward(self, pixel_values: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
         Implements the forward pass for the vision backbone.
 
@@ -251,19 +195,15 @@ class PrismaticVisionBackbone(nn.Module):
         """
         if self.num_images_in_input == 1:
             if not self.use_fused_vision_backbone:
-                return self.featurizer(pixel_values, **kwargs)
+                return self.featurizer(pixel_values)
 
             # Split `pixel_values :: [bsz, 2 * 3, resolution, resolution]` =>> featurize =>> channel stack
             img, img_fused = torch.split(pixel_values, [3, 3], dim=1)
-            if 'n_inject' in kwargs:
-                patches, patches_fused = self.featurizer(img, n_inject=kwargs['n_inject'], injected_embeddings=kwargs['injected_embeddings'][0]), self.fused_featurizer(img_fused, n_inject=kwargs['n_inject'], injected_embeddings=kwargs['injected_embeddings'][1])
-            else:
-                patches, patches_fused = self.featurizer(img), self.fused_featurizer(img_fused)
+            patches, patches_fused = self.featurizer(img), self.fused_featurizer(img_fused)
 
             return torch.cat([patches, patches_fused], dim=2)
 
         else:
-            assert len(kwargs) == 0, "Additional kwargs not supported for multi-image inputs!"
             assert self.use_fused_vision_backbone, "Multi-image inputs require using fused backbone!"
 
             # Split `pixel_values` into individual images (each with 6 channels: 3 for SigLIP + 3 for DINOv2)
@@ -335,8 +275,6 @@ class PrismaticCausalLMOutputWithPast(ModelOutput):
 
     # Additions for VLMs
     projector_features: Optional[torch.FloatTensor] = None
-    static_features: Optional[Tuple[torch.FloatTensor]] = None
-    gate_logits: Optional[torch.FloatTensor] = None
 
 
 class PrismaticPreTrainedModel(PreTrainedModel):
@@ -418,29 +356,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.pad_token_id = config.pad_token_id
         self.llm_dim = config.text_config.hidden_size
 
-        if isinstance(getattr(config, "static_ratio", 0.0), list) or getattr(config, "static_ratio", 0.0) > 0.0:
-            patch_projector(self, self.config.static_ratio)
-        else:
-            self.config.disentangle_method = "none"
-
         # HF Boilerplate =>> initializes weights via `_init_weights()` and sets gradient checkpointing
         self.post_init()
 
-    @property
-    def n_static_tokens(self):
-        if hasattr(self, 'disentangle_adapter'):
-            return self.disentangle_adapter.static_dim
-        if hasattr(self.config, "static_ratio"):
-            assert self.vision_backbone.get_num_patches() == 256
-            if isinstance(self.config.static_ratio, float):
-                return int(self.vision_backbone.get_num_patches() * self.config.static_ratio)
-            elif isinstance(self.config.static_ratio, list):
-                return [int(self.vision_backbone.get_num_patches() * r) for r in self.config.static_ratio]
-        raise AttributeError("Cannot determine number of static tokens!")
-                
-    def patch_projector(self, static_ratio):
-        return patch_projector(self, static_ratio)
-    
     # === `PreTrainedModel` Boilerplate ===
     def get_input_embeddings(self) -> nn.Module:
         return self.language_model.get_input_embeddings()
@@ -517,44 +435,16 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         all_actions_mask = current_action_mask | next_actions_mask  # (B, seq_len)
         return all_actions_mask
 
-    def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False, use_disentangle=False):
+    def _process_vision_features(self, pixel_values, language_embeddings=None, use_film=False):
         """Process vision features with optional FiLM conditioning"""
-        if self.config.disentangle_method == "inject":
-            kwargs = { 'n_inject': 12, 'injected_embeddings': self.disentangle_adapter(None, device=pixel_values.device) }
-        else:
-            kwargs = {}
         if use_film:
             # FiLM: Infuse language inputs into visual features
-            patch_features = self.vision_backbone(pixel_values, language_embeddings, **kwargs)  # (bsz, 256 * num_images, D)
+            patch_features = self.vision_backbone(pixel_values, language_embeddings)  # (bsz, 256 * num_images, D)
         else:
-            patch_features = self.vision_backbone(pixel_values, **kwargs)  # (bsz, 256 * num_images, D)
-        # Project patch embeddings into language embedding space
-        patch_features = self.projector(patch_features)
+            patch_features = self.vision_backbone(pixel_values)  # (bsz, 256 * num_images, D)
 
-        if self.config.disentangle_method == "extra":
-            static_features, dynamic_features = self.disentangle_adapter(patch_features)
-            return static_features, dynamic_features
-        elif self.config.disentangle_method == "inject":
-            try:
-                static_dim = self.disentangle_adapter.original_module.static_dim
-            except:
-                static_dim = self.disentangle_adapter.static_dim
-            return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
-        elif use_disentangle:
-            static_dim = self.n_static_tokens
-            if isinstance(static_dim, int):
-                return patch_features, { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
-            elif isinstance(static_dim, list):
-                statics = []
-                static_cum = 0
-                for i, dim in enumerate(static_dim):
-                    statics.append({ "features": patch_features[:, static_cum:static_cum+dim] })
-                    static_cum += dim
-                return patch_features, tuple(statics), patch_features[:, static_cum:]
-            else:
-                raise ValueError("Invalid type for static_dim!")
-        else:
-            return patch_features
+        # Project patch embeddings into language embedding space
+        return self.projector(patch_features)
 
     def _process_proprio_features(self, projected_patch_embeddings, proprio, proprio_projector):
         """Process proprioceptive features and append to vision features"""
@@ -625,8 +515,6 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
         use_film: bool = False,
-        other_pixel_values: Optional[torch.FloatTensor] = None,
-        timestep: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -693,66 +581,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             language_embeddings = input_embeddings[~all_actions_mask].reshape(
                 input_embeddings.shape[0], -1, input_embeddings.shape[2]
             )  # (B, lang_seq_len, llm_dim)
-            if other_pixel_values is not None and getattr(self.config, "invswap_ratio", 1.0) < 1.0:
-                assert not use_film
-                if other_pixel_values.dim() == 5:
-                    other_image_features = []
-                    other_static = []
-                    other_dynamic = []
-                    for i in range(other_pixel_values.size(1)):
-                        other_image_features_ = self._process_vision_features(other_pixel_values[:, i], language_embeddings, use_film, use_disentangle=True)
-                        if isinstance(other_image_features_, tuple):
-                            other, other_s, other_d = other_image_features_
-                            other_image_features.append(other)
-                            other_static.append(other_s)
-                            other_dynamic.append(other_d)
-                else:
-                    # selected_future_index = torch.randint(0, other_pixel_values.size(1), (1,)).item()
-                    other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film, use_disentangle=True)
-                    if isinstance(other_image_features, tuple):
-                        other_image_features, other_static, other_dynamic = other_image_features
-            
-            # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=other_pixel_values is not None)
-            if isinstance(projected_patch_embeddings, tuple):
-                image_features, static, dynamic = projected_patch_embeddings
-                if other_pixel_values is not None:
-                    if self.config.use_cache_gate:
-                        gate, gate_logits = self.cache_gate(
-                            x_past=other_image_features,
-                            x_curr=image_features,
-                            t_past=timestep[..., 0], #DERPRECATED FIXME
-                            t_curr=timestep[..., 1], #DERPRECATED FIXME
-                        )
-                        if isinstance(gate, list):
-                            static_chosens = []
-                            prev_g = None
-                            for i in range(len(gate)):
-                                g = gate[i]
-                                os = other_static[i][i]
-                                cs = static[i]
-                                static_chosen = (g[:, :, None, None] * torch.stack([os['features'], cs['features']], dim=1)).sum(1)
-                                static_chosens.append(static_chosen)
-                                if prev_g is not None:
-                                    assert ((prev_g[:, 1] - g[:, 1]) < 1e-5).all()
-                                prev_g = g
-                            static_chosens = torch.cat(static_chosens, dim=1)
-                            projected_patch_embeddings = torch.cat([static_chosens, dynamic], dim=1).contiguous()
-                        else:
-                            static_chosen = (gate[:, :, None, None] * torch.stack([other_static['features'], static['features']], dim=1)).sum(1)
-                            projected_patch_embeddings = torch.cat([static_chosen, dynamic], dim=1)
-                    else:
-                        if random.random() < self.config.invswap_ratio:
-                            projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
-                        else:
-                            projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
-                else:
-                    projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
 
-            if hasattr(self, 'attn_pooler'):
-                static['pooling'] = self.attn_pooler(static['features'])
-                other_static['pooling'] = self.attn_pooler(other_static['features'])
-                    
+            # Get visual features
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
                 projected_patch_embeddings, proprio, proprio_projector
@@ -795,7 +627,6 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
             # Build labels for multimodal sequence if needed
             multimodal_labels = self._build_multimodal_labels(labels, projected_patch_embeddings)
-            action_token_mask = torch.cat([all_actions_mask[:, :1], torch.zeros(projected_patch_embeddings.size(0), projected_patch_embeddings.size(1), 1, device=all_actions_mask.device, dtype=all_actions_mask.dtype), all_actions_mask[:, 1:]], dim=1)
 
             # Dispatch to language model
             language_model_output = self.language_model(
@@ -805,7 +636,6 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 past_key_values=None,
                 inputs_embeds=multimodal_embeddings,
                 labels=multimodal_labels,
-                action_token_mask=action_token_mask,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
@@ -842,8 +672,6 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             hidden_states=language_model_output.hidden_states,
             attentions=language_model_output.attentions,
             projector_features=projected_patch_embeddings,
-            static_features=(static, other_static) if "static" in locals() and "other_static" in locals() else None,
-            gate_logits=gate_logits if "gate_logits" in locals() else None,
         )
 
     # === GenerationMixin Methods ===
@@ -888,8 +716,25 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
     def _reorder_cache(self, *args, **kwargs) -> Any:
         return self.language_model._reorder_cache(*args, **kwargs)
 
+from collections import deque
 
-class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
+class ShouldReuse(Exception):
+    "a hack to reuse"
+
+class FlashMemory:
+    def __init__(self, e1 = 2, delta = 3):
+        self.last_reuse = False
+        self.action_memory = deque(maxlen=2)
+        self.token_memory = deque(maxlen=2)
+
+        self.e1 = e1
+        self.delta = delta
+
+    def update(self, action, token):
+        self.action_memory.append(action)
+        self.token_memory.append(token)
+
+class OpenVLAForActionPredictionFlashVLA(PrismaticForConditionalGeneration):
     config_class: PretrainedConfig = OpenVLAConfig
 
     def __init__(self, config: OpenVLAConfig) -> None:
@@ -974,7 +819,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         noisy_action_projector,
-        cache=None
     ):
         """Run diffusion-based action prediction"""
         # Clone embedding for reuse in each timestep
@@ -1021,7 +865,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 input_ids=None,
                 attention_mask=multimodal_attention_mask,
                 position_ids=None,
-                past_key_values=cache,
+                past_key_values=None,
                 inputs_embeds=multimodal_embeddings,
                 labels=None,
                 use_cache=None,
@@ -1057,7 +901,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         action_head=None,
-        cache=None
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
@@ -1069,150 +912,53 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             input_embeddings, projected_patch_embeddings, attention_mask
         )
         action_token_mask = torch.cat([all_actions_mask[:, :1], torch.zeros(projected_patch_embeddings.size(0), projected_patch_embeddings.size(1), 1, device=all_actions_mask.device, dtype=all_actions_mask.dtype), all_actions_mask[:, 1:]], dim=1)
+
         # Forward pass through language model
-        if cache is not None:
-            cache_length = cache[0][0].shape[2]
-            multimodal_embeddings = multimodal_embeddings[:, cache_length:]
-            action_token_mask = action_token_mask[:, cache_length:]
         language_model_output = self.language_model(
             input_ids=None,
             attention_mask=multimodal_attention_mask,
             position_ids=None,
-            past_key_values=cache,
+            past_key_values=None,
             inputs_embeds=multimodal_embeddings,
-            action_token_mask=action_token_mask,
             labels=None,
             use_cache=None,
             output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
+            action_token_mask=action_token_mask,
         )
-        
-        if cache is not None:
-            NUM_PROMPT_TOKENS = NUM_PROMPT_TOKENS - cache_length
 
+        # Extract hidden states for action tokens
+        last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
+        actions_hidden_states = last_hidden_states[
+            :,
+            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+            :,
+        ]  # (B, act_chunk_len, D)
+
+        # Handle different prediction methods
         if action_head is not None:
-            # Extract hidden states for action tokens
-            last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
-            actions_hidden_states = last_hidden_states[
-                :,
-                NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-                :,
-            ]  # (B, act_chunk_len, D)
-
             # L1 regression prediction
             normalized_actions = action_head.predict_action(actions_hidden_states)
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
-            reponse_ids = None
         else:
-            NUM_PROMPT_TOKENS = NUM_PROMPT_TOKENS + NUM_PATCHES
-            batch_size = language_model_output.logits.shape[0]
-            device = language_model_output.logits.device
-        
-            start_indices = torch.tensor([NUM_PROMPT_TOKENS], device=device).unsqueeze(1)  # [batch_size, 1]
-            position_offsets = torch.arange(ACTION_DIM * NUM_ACTIONS_CHUNK, device=device).unsqueeze(0)  # [1, seq_length]
-            seq_indices = start_indices + position_offsets  # [batch_size, ACTION_DIM*NUM_ACTIONS_CHUNK]
-            #test end
-            #test add
-            #print("language_model_output",language_model_output.logits.shape[-1])
-            #print("self.vocab_size",self.vocab_size) 32000
-            #topk_values, topk_indices = torch.topk(language_model_output.logits, k=256, dim=-1)
-            #print(topk_indices)
-            #assert language_model_output.logits.shape[-1] == self.vocab_size
-            #test add
-            do_sample = False
-            if do_sample == False:
-                #org
-                # reponse_ids = language_model_output.logits[
-                #         :,
-                #         NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-                #     ].argmax(dim=2)
-                #reponse_ids = language_model_output.logits[actions_masks].argmax(dim=2)
-                #org end
-                
-                #padding
-                # reponse_ids = language_model_output.logits[
-                #     torch.arange(batch_size, device=device).unsqueeze(-1),  
-                #     seq_indices, 
-                #     :
-                # ].argmax(dim=2)  
-                #padding end
-                
-                #padding + only get last 256 token
-                reponse_ids_logits = language_model_output.logits[
-                    torch.arange(batch_size, device=device).unsqueeze(-1),  
-                    seq_indices, 
-                    :
+            # Discrete token-based prediction
+            predicted_action_token_ids = (
+                language_model_output.logits[
+                    :,
+                    NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
                 ]
-                start_index = self.vocab_size - 256 
-                response_last256 = reponse_ids_logits[..., -256-64:-64]  # Shape: [batch_size, seq_len, 256]
-                last256_argmax = response_last256.argmax(dim=-1)  # Shape: [batch_size, seq_len]
-                reponse_ids = last256_argmax + start_index  # Shape: [batch_size, seq_len]
-                #padding + only get last 256 token end
-                
-                predicted_action_token_ids = reponse_ids.cpu().numpy()
-                    
-            else:
-                assert temperature>0
-                #org 
-                # action_logits  = language_model_output.logits[
-                #         :,
-                #         NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-                #     ]
-                #action_logits = language_model_output.logits[actions_masks]
-                #org end
-                
-                action_logits = language_model_output.logits[
-                    torch.arange(batch_size, device=device).unsqueeze(-1),  
-                    seq_indices, 
-                    :
-                ]  
-                # padding 
-                # scaled_logits = action_logits / temperature
-                # probs = torch.softmax(scaled_logits, dim=-1)
-                # probs_flat = probs.reshape(-1, probs.shape[-1])  # (B*act_chunk_len, vocab_size)
-                # sampled_indices_flat = torch.multinomial(probs_flat, num_samples=1)  # (B*act_chunk_len, 1)
-                # reponse_ids = sampled_indices_flat.view(action_logits.shape[0], -1)
-                # padding end 
-                
-                #padding + only get last 256 token
-                action_logits_last256 = action_logits[..., -256-64:-64]
-                scaled_logits = action_logits_last256 / temperature
-                probs = torch.softmax(scaled_logits, dim=-1)
-                assert probs.shape[-1] == 256
-                probs_flat = probs.reshape(-1, probs.shape[-1])
-                sampled_indices_flat = torch.multinomial(probs_flat, num_samples=1)
-                original_ids_flat = sampled_indices_flat + (self.vocab_size - 256)
-                reponse_ids = original_ids_flat.view(action_logits.shape[0], -1)
-                #padding + only get last 256 token end
-                
-                predicted_action_token_ids = reponse_ids.cpu().numpy()
-        
+                .argmax(dim=2)
+                .cpu()
+                .numpy()
+            )
             discretized_actions = self.vocab_size - predicted_action_token_ids
             discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
             normalized_actions = self.bin_centers[discretized_actions]
-            #normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
-            normalized_actions = normalized_actions.reshape(-1, ACTION_DIM)
+            normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
 
-        return normalized_actions, reponse_ids, language_model_output.past_key_values
-    
-    def truncate_cache(
-        self,
-        past_key_values,
-        length=None,
-    ):
-        if not hasattr(self, "n_static_tokens"):
-            return past_key_values
-        if length is None:
-            length = self.n_static_tokens
-            if isinstance(length, list):
-                length = sum(length)
-        past_key_values = tuple(
-            (k_cache[:, :, :length, :], v_cache[:, :, :length, :])
-            for k_cache, v_cache in past_key_values
-        )
-        return past_key_values
+        return normalized_actions, actions_hidden_states
 
     def predict_action(
         self,
@@ -1223,7 +969,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         noisy_action_projector=None,
         use_film: bool = False,
-        cache = None,
         **kwargs: str,
     ) -> np.ndarray:
         """Predict actions from input sequence, with options for different prediction methods.
@@ -1243,161 +988,134 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """
         # If the special empty token ('') does not already appear after the colon (':') token in the prompt
         # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
-        if not torch.all(input_ids[:, -1] == 29871):
-            input_ids = torch.cat(
-                (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
-            )
-
-        pixel_values = kwargs["pixel_values"]
-        attention_mask = kwargs["attention_mask"]
-
-        # Create fake labels tensor (needed for action mask)
-        labels = input_ids.clone()
-        labels[:] = IGNORE_INDEX
-
-        # Get number of tokens in prompt (excluding the start token)
-        NUM_PROMPT_TOKENS = input_ids.shape[-1] - 1  # Subtract action tokens and stop token
-
-        # Prepare inputs by adding necessary tokens
-        input_ids, attention_mask = self._prepare_input_for_action_prediction(input_ids, attention_mask)
-
-        # Update labels tensor for action mask computation later
-        labels = self._prepare_labels_for_action_prediction(labels, input_ids)
-
-        # Get input embeddings and action masks
-        input_embeddings = self.get_input_embeddings()(input_ids)
-        all_actions_mask = self._process_action_masks(labels)
-
-        # Extract language embeddings
-        language_embeddings = input_embeddings[~all_actions_mask].reshape(
-            input_embeddings.shape[0], -1, input_embeddings.shape[2]
-        )
-
-        # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film, use_disentangle=hasattr(self, "n_static_tokens"))
-        if isinstance(projected_patch_embeddings, tuple):
-            image_features, static, dynamic = projected_patch_embeddings
-        
-        if (other_pixel_values := kwargs.get("other_pixel_values", None)) is not None:
-            other_image_features = self._process_vision_features(other_pixel_values, language_embeddings, use_film, use_disentangle=True)
-            if isinstance(other_image_features, tuple):
-                other_image_features, other_static, other_dynamic = other_image_features
-
-        if getattr(self.config, "use_cache_gate", False):
-            past_key_values = None
-            if self.history_image is None:
-                self.history_image = (projected_patch_embeddings, projected_patch_embeddings)
-                if isinstance(self.config.static_ratio, int):
-                    if not hasattr(self, 'time_gaps'):
-                        self.time_gaps = []
-                    self.time_gaps.append(0)
-                elif isinstance(self.config.static_ratio, list):
-                    if not hasattr(self, 'time_gaps'):
-                        self.time_gaps = [[] for _ in range(len(self.config.static_ratio))]
-                    for time_gaps in self.time_gaps:
-                        time_gaps.append(0)
-            else:
-                other_image_features, other_static, other_dynamic = map(list, zip(*self.history_image))
-                _, gate_logits = self.cache_gate(
-                    x_past=other_image_features,
-                    x_curr=image_features,
-                    t_past=None,
-                    t_curr=None,
+        try:
+            if not torch.all(input_ids[:, -1] == 29871):
+                input_ids = torch.cat(
+                    (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
                 )
-                if isinstance(gate_logits, list):
-                    recache_prob = tuple(gl.softmax(dim=-1)[:, 1].item() for gl in gate_logits) # batch size must be 1
-                    if not hasattr(self, 'recache_probs'):
-                        self.recache_probs = []
-                    self.recache_probs.append(recache_prob)
-                    assert len(recache_prob) == 2 #FIXME: only support 2 images now
-                    for i, recache_p in enumerate(recache_prob):
-                        if i == 0:
-                            if recache_p > 0.9:
-                                cache = None
-                                self.history_image = (projected_patch_embeddings, projected_patch_embeddings)
-                                for time_gaps in self.time_gaps:
-                                    time_gaps.append(0)
-                                break
-                            else:
-                                self.time_gaps[0][-1] += 1
-                        else:
-                            if recache_p > 0.7:
-                                cache = self.truncate_cache(cache, length=self.n_static_tokens[i-1])
-                                self.history_image = (self.history_image[0], projected_patch_embeddings)
-                                self.time_gaps[i].append(0)
-                            else:
-                                self.time_gaps[i][-1] += 1
-                else:
-                    recache_prob = gate_logits.softmax(dim=-1)[:, 1].item() # batch size must be 1
-                    if not hasattr(self, 'recache_probs'):
-                        self.recache_probs = []
-                    self.recache_probs.append(recache_prob)
-                    if recache_prob > 0.7:
-                        cache = None
-                        self.history_image = projected_patch_embeddings
-                        self.time_gaps.append(0)
-                    else:
-                        self.time_gaps[-1] += 1
 
-        if isinstance(projected_patch_embeddings, tuple):
-            projected_patch_embeddings = image_features
-        
-        # Add proprioceptive features if provided
-        use_proprio = proprio_projector is not None and proprio is not None
-        if use_proprio:
-            proprio = torch.Tensor(proprio).to(projected_patch_embeddings.device, dtype=projected_patch_embeddings.dtype)
-            projected_patch_embeddings = self._process_proprio_features(
-                projected_patch_embeddings, proprio, proprio_projector
+            pixel_values = kwargs["pixel_values"]
+            attention_mask = kwargs["attention_mask"]
+
+            # Create fake labels tensor (needed for action mask)
+            labels = input_ids.clone()
+            labels[:] = IGNORE_INDEX
+
+            # Get number of tokens in prompt (excluding the start token)
+            NUM_PROMPT_TOKENS = input_ids.shape[-1] - 1  # Subtract action tokens and stop token
+
+            # Prepare inputs by adding necessary tokens
+            input_ids, attention_mask = self._prepare_input_for_action_prediction(input_ids, attention_mask)
+
+            # Update labels tensor for action mask computation later
+            labels = self._prepare_labels_for_action_prediction(labels, input_ids)
+
+            # Get input embeddings and action masks
+            input_embeddings = self.get_input_embeddings()(input_ids)
+            all_actions_mask = self._process_action_masks(labels)
+
+            # Extract language embeddings
+            language_embeddings = input_embeddings[~all_actions_mask].reshape(
+                input_embeddings.shape[0], -1, input_embeddings.shape[2]
             )
 
-        # Use diffusion if provided, otherwise use regression or discrete prediction
-        use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
+            # Process vision features
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
 
-        # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
-        NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
-        if use_proprio:
-            NUM_PATCHES += 1
-        if use_diffusion:
-            NUM_PATCHES += 1
+            topk = 160
+            U, S, Vh = torch.linalg.svd(projected_patch_embeddings.float(), full_matrices=False)
+            C = (U @ S.unsqueeze(-1)).squeeze(-1)
+            sig_token_inds = torch.topk(C, dim=-1, k=topk)[1]
+            non_sig_token_inds = torch.topk(C, dim=-1, k=C.size(1)-topk, largest=False)[1]
 
-        if use_diffusion:
-            # Sample random noise with shape equal to output action, used as the starting state for reverse diffusion
-            noise = torch.randn(
-                size=(1, NUM_ACTIONS_CHUNK, ACTION_DIM), device=input_embeddings.device, dtype=input_embeddings.dtype
-            )
+            if len(self.flash_memory.token_memory)>= 2:
+                assert len(self.flash_memory.action_memory) == 2
+                Is_2, Is_1 = self.flash_memory.token_memory
+                union = torch.cat((Is_2, Is_1), dim=-1).unique()
+                phi_s = torch.cat((Is_2, Is_1), dim=-1).unique().size(0) / Is_1.squeeze().size(0)
+                A2 = self.flash_memory.action_memory[0][0]
+                A1 = self.flash_memory.action_memory[1][0]
+                dot = A2 @ A1.T
 
-            # Run diffusion-based prediction
-            normalized_actions, actions_hidden_states = self._run_diffusion_prediction(
-                input_embeddings,
-                all_actions_mask,
-                noise,
-                action_head,
-                projected_patch_embeddings,
-                labels,
-                attention_mask,
-                NUM_PATCHES,
-                NUM_PROMPT_TOKENS,
-                noisy_action_projector,
-                cache=cache,
-            )
-        else:
-            # Run regression or discrete token-based prediction
-            normalized_actions, actions_hidden_states, past_key_values = self._regression_or_discrete_prediction(
-                input_embeddings,
-                all_actions_mask,
-                projected_patch_embeddings,
-                attention_mask,
-                labels,
-                NUM_PATCHES,
-                NUM_PROMPT_TOKENS,
-                action_head,
-                cache=cache,
-            )
+                # Norms
+                norm_A2 = np.linalg.norm(A2, axis=1, keepdims=True)   # (N, 1)
+                norm_A1 = np.linalg.norm(A1, axis=1, keepdims=True)   # (M, 1)
 
-        # Unnormalize predicted actions
-        actions = self._unnormalize_actions(normalized_actions, unnorm_key)
+                # Cosine of angles (broadcasting happens here)
+                cos_angles = dot / (norm_A2 * norm_A1.T)
 
-        return actions, actions_hidden_states, self.truncate_cache(past_key_values)
+                # Numerical safety (important!)
+                cos_angles = np.clip(cos_angles, -1.0, 1.0)
+
+                # Angles in degrees
+                alpha_s = np.degrees(np.arccos(cos_angles)).mean()  # (N, M)
+                reuse_action = (alpha_s > 50) and (phi_s > (1 - 6 /  Is_1.squeeze().size(0)))
+                # reuse_action = False
+                if reuse_action and (not self.flash_memory.last_reuse):
+                    self.time_gaps.append(0)
+                    raise ShouldReuse
+            self.time_gaps.append(1)
+            self.flash_memory.token_memory.append(sig_token_inds)
+            self.flash_memory.last_reuse = False
+
+            # Add proprioceptive features if provided
+            use_proprio = proprio_projector is not None and proprio is not None
+            if use_proprio:
+                proprio = torch.Tensor(proprio).to(projected_patch_embeddings.device, dtype=projected_patch_embeddings.dtype)
+                projected_patch_embeddings = self._process_proprio_features(
+                    projected_patch_embeddings, proprio, proprio_projector
+                )
+
+            # Use diffusion if provided, otherwise use regression or discrete prediction
+            use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
+
+            # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
+            NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
+            if use_proprio:
+                NUM_PATCHES += 1
+            if use_diffusion:
+                NUM_PATCHES += 1
+
+            if use_diffusion:
+                # Sample random noise with shape equal to output action, used as the starting state for reverse diffusion
+                noise = torch.randn(
+                    size=(1, NUM_ACTIONS_CHUNK, ACTION_DIM), device=input_embeddings.device, dtype=input_embeddings.dtype
+                )
+
+                # Run diffusion-based prediction
+                normalized_actions, actions_hidden_states = self._run_diffusion_prediction(
+                    input_embeddings,
+                    all_actions_mask,
+                    noise,
+                    action_head,
+                    projected_patch_embeddings,
+                    labels,
+                    attention_mask,
+                    NUM_PATCHES,
+                    NUM_PROMPT_TOKENS,
+                    noisy_action_projector,
+                )
+            else:
+                # Run regression or discrete token-based prediction
+                normalized_actions, actions_hidden_states = self._regression_or_discrete_prediction(
+                    input_embeddings,
+                    all_actions_mask,
+                    projected_patch_embeddings,
+                    attention_mask,
+                    labels,
+                    NUM_PATCHES,
+                    NUM_PROMPT_TOKENS,
+                    action_head,
+                )
+
+            # Unnormalize predicted actions
+            actions = self._unnormalize_actions(normalized_actions, unnorm_key)
+            self.flash_memory.action_memory.append((actions, actions_hidden_states))
+        except ShouldReuse:
+            actions, actions_hidden_states = self.flash_memory.action_memory[-1]
+            self.flash_memory.last_reuse = True
+
+        return actions, actions_hidden_states, None
 
     @staticmethod
     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:

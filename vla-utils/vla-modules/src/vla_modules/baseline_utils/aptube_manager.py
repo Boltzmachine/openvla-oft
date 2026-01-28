@@ -298,7 +298,7 @@ class APTubeManager:
             aggregated_scores = aggregated_scores / len(layer_ids)
             
         result = aggregated_scores.cpu()
-        print(f"    DEBUG: Attention computed, mode: {attention_mode}, layers: {layer_ids}, use_multi_layer: {use_multi_layer}, shape: {result.shape}")
+        # print(f"    DEBUG: Attention computed, mode: {attention_mode}, layers: {layer_ids}, use_multi_layer: {use_multi_layer}, shape: {result.shape}")
         return result
 
     def get_top_attention_patches(self, attn_scores, top_k=None):
@@ -352,18 +352,18 @@ class APTubeManager:
         
         # try:
         # Extract patch relevance using VLA-Cache method
-        print(f"  DEBUG: Starting VLA-Cache attention processing...")
+        # print(f"  DEBUG: Starting VLA-Cache attention processing...")
         patch_relevance = self.token_attention_merge(
             self.last_attention_layers, 
             attention_mode=self.attention_mode,
             use_multi_layer=self.use_multi_layer
         )
-        print(f"  DEBUG: Patch relevance shape: {patch_relevance.shape}, min: {patch_relevance.min():.4f}, max: {patch_relevance.max():.4f}")
+        # print(f"  DEBUG: Patch relevance shape: {patch_relevance.shape}, min: {patch_relevance.min():.4f}, max: {patch_relevance.max():.4f}")
         
         # Get top-k important patches
         important_patch_indices = self.get_top_attention_patches(patch_relevance)
-        print(f"  DEBUG: Selected {len(important_patch_indices)} important patches (top-{self.attention_top_k})")
-        print(f"  DEBUG: Important patch indices (first 10): {important_patch_indices[:10]}")
+        # print(f"  DEBUG: Selected {len(important_patch_indices)} important patches (top-{self.attention_top_k})")
+        # print(f"  DEBUG: Important patch indices (first 10): {important_patch_indices[:10]}")
         
         # Create recompute mask: True for important patches (must recompute), False for others (can reuse)
         device = get_pixel_values_device(self.last_pixel_values)
@@ -375,7 +375,7 @@ class APTubeManager:
         
         reuse_count = (recompute_mask == False).sum().item()
         recompute_count = (recompute_mask == True).sum().item() 
-        print(f"  DEBUG: Will recompute {recompute_count}/256 task-relevant patches, reuse {reuse_count}/256 patches ({reuse_count/256*100:.1f}% reuse)")
+        # print(f"  DEBUG: Will recompute {recompute_count}/256 task-relevant patches, reuse {reuse_count}/256 patches ({reuse_count/256*100:.1f}% reuse)")
         
         # Both encoders use same mask for now
         return recompute_mask, recompute_mask.clone()
@@ -422,12 +422,12 @@ class APTubeManager:
         hybrid_reuse_rate = (reuse_dino + reuse_siglip) / 512 * 100
         
         # if self.step_counter % self.PRINT_INTERVAL == 0:
-        if True:
-            print(f"  DEBUG: Hybrid Analysis:")
-            print(f"    Pixel: {pixel_dynamic_count}/256 dynamic patches")
-            print(f"    Attention: {attention_relevant_count}/256 task-relevant patches")  
-            print(f"    Hybrid: DINO {reuse_dino}/256 reuse, SigLIP {reuse_siglip}/256 reuse")
-            print(f"    Combined reuse rate: {hybrid_reuse_rate:.1f}%")
+        # if True:
+        #     print(f"  DEBUG: Hybrid Analysis:")
+        #     print(f"    Pixel: {pixel_dynamic_count}/256 dynamic patches")
+        #     print(f"    Attention: {attention_relevant_count}/256 task-relevant patches")  
+        #     print(f"    Hybrid: DINO {reuse_dino}/256 reuse, SigLIP {reuse_siglip}/256 reuse")
+        #     print(f"    Combined reuse rate: {hybrid_reuse_rate:.1f}%")
         
         return hybrid_recompute_dino, hybrid_recompute_siglip
             

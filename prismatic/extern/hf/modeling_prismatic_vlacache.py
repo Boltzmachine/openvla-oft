@@ -349,8 +349,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         )
 
         # Instantiate LLM Backbone
-        from .modeling_prismatic_vlacache import LlamaForCausalLMVLACache
-        self.language_model = LlamaForCausalLMVLACache.from_config(
+        from .modeling_llama_vlacache import LlamaForCausalLMVLACache
+        self.language_model = LlamaForCausalLMVLACache._from_config(
             config.text_config, attn_implementation=config._attn_implementation
         )
         self.vocab_size = config.text_config.vocab_size
@@ -718,7 +718,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         return self.language_model._reorder_cache(*args, **kwargs)
 
 
-class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
+class OpenVLAForActionPredictionVLACache(PrismaticForConditionalGeneration):
     config_class: PretrainedConfig = OpenVLAConfig
 
     def __init__(self, config: OpenVLAConfig) -> None:
@@ -874,6 +874,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Return final actions
         return curr_noisy_actions.float().cpu().detach().numpy(), actions_hidden_states
+    
 
     def _regression_or_discrete_prediction(
         self,
@@ -885,6 +886,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         action_head=None,
+        past_key_values = None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
@@ -895,28 +897,31 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
             input_embeddings, projected_patch_embeddings, attention_mask
         )
-
+        action_token_mask = torch.cat([all_actions_mask[:, :1], torch.zeros(projected_patch_embeddings.size(0), projected_patch_embeddings.size(1), 1, device=all_actions_mask.device, dtype=all_actions_mask.dtype), all_actions_mask[:, 1:]], dim=1)
+        
         # Forward pass through language model
         language_model_output = self.language_model(
             input_ids=None,
             attention_mask=multimodal_attention_mask,
             position_ids=None,
-            past_key_values=None,
+            past_key_values=past_key_values,
             inputs_embeds=multimodal_embeddings,
             labels=None,
-            use_cache=None,
-            output_attentions=False,
+            use_cache=True,
+            output_attentions=True,
             output_hidden_states=True,
             return_dict=True,
+            action_token_mask=action_token_mask,
         )
 
         # Extract hidden states for action tokens
         last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
         actions_hidden_states = last_hidden_states[
             :,
-            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+            - ACTION_DIM * NUM_ACTIONS_CHUNK - 2 : -2,
             :,
         ]  # (B, act_chunk_len, D)
+        last_caches = {"past_key_values": language_model_output.past_key_values, "attentions": language_model_output.attentions}
 
         # Handle different prediction methods
         if action_head is not None:
@@ -940,7 +945,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             normalized_actions = self.bin_centers[discretized_actions]
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
 
-        return normalized_actions, actions_hidden_states
+        return normalized_actions, actions_hidden_states, last_caches
 
     def predict_action(
         self,
@@ -951,6 +956,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         noisy_action_projector=None,
         use_film: bool = False,
+        past_key_values = None,
         **kwargs: str,
     ) -> np.ndarray:
         """Predict actions from input sequence, with options for different prediction methods.
@@ -1042,7 +1048,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
         else:
             # Run regression or discrete token-based prediction
-            normalized_actions, actions_hidden_states = self._regression_or_discrete_prediction(
+            normalized_actions, actions_hidden_states, last_caches = self._regression_or_discrete_prediction(
                 input_embeddings,
                 all_actions_mask,
                 projected_patch_embeddings,
@@ -1051,12 +1057,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PATCHES,
                 NUM_PROMPT_TOKENS,
                 action_head,
+                past_key_values,
             )
 
         # Unnormalize predicted actions
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
 
-        return actions, actions_hidden_states
+        return actions, actions_hidden_states, last_caches
 
     @staticmethod
     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:

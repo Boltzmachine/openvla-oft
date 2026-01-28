@@ -33,7 +33,7 @@ from prismatic.vla.constants import (
     ACTION_PROPRIO_NORMALIZATION_TYPE,
 )
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
-
+from .vla_cache_utils import find_static_patches, task_relevant_selection, get_layer_mask_schedule
 # Initialize important constants
 DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
@@ -292,6 +292,12 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     if cfg.baseline == 'ttf':
         from prismatic.extern.hf.modeling_prismatic_ttf import OpenVLAForActionPredictionTTF
         model_cls = OpenVLAForActionPredictionTTF
+    elif cfg.baseline == "vlacache":
+        from prismatic.extern.hf.modeling_prismatic_vlacache import OpenVLAForActionPredictionVLACache
+        model_cls = OpenVLAForActionPredictionVLACache
+    elif cfg.baseline == "flashvla":
+        from prismatic.extern.hf.modeling_prismatic_flashvla import OpenVLAForActionPredictionFlashVLA
+        model_cls = OpenVLAForActionPredictionFlashVLA
     elif cfg.baseline == "none":
         model_cls = OpenVLAForActionPrediction
     else:
@@ -799,10 +805,40 @@ def get_vla_action(
             inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
             
         if history_image is not None:
-            history_image = prepare_images_for_vla([history_image], cfg)[0]
-            history_inputs = processor(prompt, history_image).to(DEVICE, dtype=torch.bfloat16)
-            history_pixel_values = history_inputs["pixel_values"]
-            inputs["other_pixel_values"] = history_pixel_values
+            if cfg.baseline == 'vlacache':
+                last_caches = cache
+                prompt_cache = last_caches['past_key_values'] if last_caches is not None else None
+                prev_attn = last_caches['attentions'] if last_caches is not None else None
+                mask_indices = None
+                vla.language_model.config.proportion_attn_var = None
+                # print(">> VLA-Cache inference mode")
+                # Step 1: Identify visually stable patches across frames
+                if prompt_cache is not None:
+                    result_image = primary_image.copy()
+                    stable_patches_primary = find_static_patches(primary_image, history_image, top_k=20)
+                    # stable_patches_wrist = find_static_patches(all_images[1], prev_images[1], top_k=150)
+
+                # Step 2: Use prior attention to filter out task-relevant tokens
+                if prev_attn is not None:
+                    vis_primary, remaining_static_tokens_primary = task_relevant_selection(
+                        prev_attn, result_image, stable_patches_primary, primary=True
+                    )
+                    # vis_wrist, remaining_static_tokens_wrist = task_relevant_selection(
+                    #     prev_attn, result_image[1], stable_patches_wrist, primary=False
+                    # )
+
+                    # result_image = [vis_primary, vis_wrist]
+
+                    # Step 3: Merge remaining static token indices and update model config
+                    final_static_token_indices = remaining_static_tokens_primary# + remaining_static_tokens_wrist
+                    mask_indices = torch.tensor(final_static_token_indices, device=DEVICE) if final_static_token_indices else None
+                    vla.language_model.config.reusable_patches = mask_indices
+                    vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
+            else:
+                history_image = prepare_images_for_vla([history_image], cfg)[0]
+                history_inputs = processor(prompt, history_image).to(DEVICE, dtype=torch.bfloat16)
+                history_pixel_values = history_inputs["pixel_values"]
+                inputs["other_pixel_values"] = history_pixel_values
 
         # Process proprioception data if used
         proprio = None
@@ -813,22 +849,46 @@ def get_vla_action(
             proprio = obs["state"]
 
         # Generate action
-        if action_head is None:
-            # Standard VLA output (single-image inputs, discrete actions)
-            action, _, cache = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False, cache=cache)
+        if cfg.baseline == "vlacache":
+            from vla_modules.calflops import calculate_flops
+            (action, _, cache ), (flops, macs, params) = calculate_flops(model=vla, 
+                                          kwargs=dict(
+                                                **inputs,
+                                                unnorm_key=cfg.unnorm_key,
+                                                do_sample=False,
+                                                proprio=proprio,
+                                                proprio_projector=proprio_projector,
+                                                noisy_action_projector=noisy_action_projector,
+                                                action_head=action_head,
+                                                use_film=use_film,
+                                                cache=cache,
+                                            ),
+                                            print_results=False,
+                                            print_detailed=False,
+                                            forward_mode="predict_action",
+                                            return_model_out=True,
+                                            output_as_string=False,
+                                    )
+            if not hasattr(vla, "flops"):
+                vla.flops = []
+            vla.flops.append(flops)
         else:
-            # Custom action head for continuous actions
-            action, _, cache = vla.predict_action(
-                **inputs,
-                unnorm_key=cfg.unnorm_key,
-                do_sample=False,
-                proprio=proprio,
-                proprio_projector=proprio_projector,
-                noisy_action_projector=noisy_action_projector,
-                action_head=action_head,
-                use_film=use_film,
-                cache=cache,
-            )
+            if action_head is None:
+                # Standard VLA output (single-image inputs, discrete actions)
+                action, _, cache = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False, cache=cache)
+            else:
+                # Custom action head for continuous actions
+                action, _, cache = vla.predict_action(
+                    **inputs,
+                    unnorm_key=cfg.unnorm_key,
+                    do_sample=False,
+                    proprio=proprio,
+                    proprio_projector=proprio_projector,
+                    noisy_action_projector=noisy_action_projector,
+                    action_head=action_head,
+                    use_film=use_film,
+                    cache=cache,
+                )
 
     # Return action chunk as list of actions
     return [action[i] for i in range(len(action))], cache

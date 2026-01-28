@@ -604,7 +604,6 @@ class LlamaSdpaAttention(LlamaAttention):
     SDPA API.
     """
 
-    # Adapted from LlamaAttention.forward
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -614,6 +613,8 @@ class LlamaSdpaAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
@@ -629,6 +630,7 @@ class LlamaSdpaAttention(LlamaAttention):
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
+                position_embeddings=position_embeddings,
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -637,15 +639,22 @@ class LlamaSdpaAttention(LlamaAttention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # use -1 to infer num_heads and num_key_value_heads as they may vary if tensor parallel is used
+        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        if position_embeddings is None:
+            logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        # In case static cache is used, it is an instance attribute.
-        past_key_value = getattr(self, "past_key_value", past_key_value)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -668,17 +677,74 @@ class LlamaSdpaAttention(LlamaAttention):
 
         # In case we are not compiling, we may set `causal_mask` to None, which is required to dispatch to SDPA's Flash Attention 2 backend, rather
         # relying on the `is_causal` argument.
+
+        # NOTE (Moo Jin):
+        # We must set `is_causal` == False (to disable the default lower triangular causal mask) and `attn_mask` to the correct attention mask.
+        #
+        # This is a bit tricky given that we have pad tokens due to collation with samples of different lengths. If there weren't any pad tokens,
+        # we could just set `attn_mask` to all zeros, which represents a non-causal bi-directional mask (i.e. attend to all tokens). However,
+        # given that we have pad tokens, we need to actually mask out the pad tokens (i.e. set certain attention weights to negative infinity)
+        # so that we don't attend to pad tokens.
+        #
+        # The default causal mask logic produces a `causal_mask` where the lower triangle is all zeros if there are no pad tokens in the sample,
+        # and the rest of the elements are negative infinity.
+        # If there are K pad tokens in the sample, then the last K columns in `causal_mask` (which has shape (B, 1, seq_len, seq_len)) are
+        # additionally negative infinity.
+        # Example:
+        #
+        # No pad tokens:
+        #   0 -inf -inf
+        #   0   0  -inf
+        #   0   0    0
+        # 1 pad token:
+        #   0 -inf -inf
+        #   0   0  -inf
+        #   0   0  -inf
+        # 2 pad tokens:
+        #   0 -inf -inf
+        #   0 -inf -inf
+        #   0 -inf -inf
+        #
+        # Intuitively, this stops the last few tokens from attending to the last K tokens which are pad tokens.
+        #
+        # Okay so the above is what the default causal mask logic returns. But what we want is a mask that is all 0s except for the positions corresponding to pad tokens.
+        # What we want is illustrated below.
+        #
+        # No pad tokens:
+        #   0   0    0
+        #   0   0    0
+        #   0   0    0
+        # 1 pad token:
+        #   0   0  -inf
+        #   0   0  -inf
+        #   0   0  -inf
+        # 2 pad tokens:
+        #   0 -inf -inf
+        #   0 -inf -inf
+        #   0 -inf -inf
+        #
+        # Trick: To get this mask, we just take the last row of the old `causal_mask` and duplicate it all the way through to get the new mask. You can see that this trick
+        # works by looking at the matrices above.
+        # if causal_mask is not None:
+        #     D = causal_mask.shape[-1]
+        #     last_row = causal_mask[:, :, -1, :].clone()
+        #     new_mask = last_row.unsqueeze(2).expand(-1, -1, D, -1)
+        #     causal_mask = new_mask
+
+        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+        is_causal = False
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
             attn_mask=causal_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=causal_mask is None and q_len > 1,
+            is_causal=is_causal,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.view(bsz, q_len, -1)
 
         attn_output = self.o_proj(attn_output)
 
@@ -959,6 +1025,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        action_token_mask: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -981,17 +1048,15 @@ class LlamaModel(LlamaPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # past_seen_tokens = 0
+        past_seen_tokens = 0
         if use_cache:  # kept for BC (cache positions)
             if not isinstance(past_key_values, StaticCache):
-                if past_key_values is None:
-                    past_key_values = DynamicCache()
-                else:
-                    past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-                # past_seen_tokens = past_key_values.get_seq_length()  if self.config.proportion_attn_var is None else 0
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                past_seen_tokens = past_key_values.get_seq_length()  if self.config.proportion_attn_var is None else 0
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length()  if self.config.proportion_attn_var is None or inputs_embeds.shape[1]==1 else 0
+            if isinstance(past_key_values, StaticCache):
+                raise ValueError("cache_position is a required argument when using StaticCache.")
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -1001,6 +1066,11 @@ class LlamaModel(LlamaPreTrainedModel):
 
         causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens, output_attentions)
 
+        last_row = causal_mask[:, :, -1:, :].clone()
+        if action_token_mask is None:
+            causal_mask = last_row.expand(-1, -1, causal_mask.shape[-1], -1)
+        else:
+            causal_mask = torch.where(action_token_mask.unsqueeze(1), last_row, causal_mask)
         # embed positions
         hidden_states = inputs_embeds
 
@@ -1018,12 +1088,14 @@ class LlamaModel(LlamaPreTrainedModel):
         start_event.record()
 
         for layer_idx, decoder_layer in enumerate(self.layers):
-            
-            if self.config.proportion_attn_var is not None and inputs_embeds.size(1) != 1 and layer_idx in self.pruning_loc:
+            if inputs_embeds.size(1) != 1 and layer_idx in self.pruning_loc and self.config.reusable_patches is not None:
                 reusable_patches = self.config.reusable_patches
-                proportion = self.config.proportion_attn_var[layer_idx]
-                top_k = max(1, int(proportion * len(reusable_patches)))
-                selected_reusable_patches = reusable_patches[:top_k]
+                if self.config.proportion_attn_var is not None:
+                    proportion = self.config.proportion_attn_var[layer_idx]
+                    top_k = max(1, int(proportion * len(reusable_patches)))
+                    selected_reusable_patches = reusable_patches[:top_k]
+                else:
+                    selected_reusable_patches = reusable_patches
                 
                 if last_reusable_patches is None:
                     last_reusable_patches = selected_reusable_patches
@@ -1034,6 +1106,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     bs,seq_length = inputs_embeds.shape[0], inputs_embeds.shape[1]
                     full_position = torch.arange(seq_length, device=inputs_embeds.device)
                     mask = ~torch.isin(cache_position, selected_reusable_patches)
+
                     new_cache_position = cache_position[mask]
                     new_cache_position, _ = new_cache_position.sort()
                     assert new_cache_position.size(0) + selected_reusable_patches.size(0) == seq_length, f"{new_cache_position.size(0)} + {selected_reusable_patches.size(0)} != {seq_length}"
@@ -1098,7 +1171,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
             FLOPs_avg_sample = (self.all_FLOPs / self.num_forward) * 1e-12
             cuda_time_avg = self.total_cuda_time / self.num_forward
-            print(f"Current CUDA latency: {cuda_time_current:.6f} ms | Average CUDA latency: {cuda_time_avg:.6f} ms, Average TFLOPs: {FLOPs_avg_sample:.6f}")
+            # print(f"Current CUDA latency: {cuda_time_current:.6f} ms | Average CUDA latency: {cuda_time_avg:.6f} ms, Average TFLOPs: {FLOPs_avg_sample:.6f}")
     
 
         hidden_states = self.norm(hidden_states)
@@ -1135,14 +1208,14 @@ class LlamaModel(LlamaPreTrainedModel):
             if attention_mask is not None and 0.0 in attention_mask:
                 return attention_mask
             return None
-        # output_attentions = False
-        if self.config._attn_implementation == "sdpa" and not output_attentions:
-            # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument,
-            # in order to dispatch on Flash Attention 2.
-            if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                attention_mask, inputs_embeds=input_tensor, past_key_values_length=past_seen_tokens
-            ):
-                return None
+        output_attentions = False
+        # if self.config._attn_implementation == "sdpa" and not output_attentions:
+        #     # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument,
+        #     # in order to dispatch on Flash Attention 2.
+        #     if AttentionMaskConverter._ignore_causal_mask_sdpa(
+        #         attention_mask, inputs_embeds=input_tensor, past_key_values_length=past_seen_tokens
+        #     ):
+        #         return None
 
         dtype, device = input_tensor.dtype, input_tensor.device
         min_dtype = torch.finfo(dtype).min
@@ -1151,7 +1224,9 @@ class LlamaModel(LlamaPreTrainedModel):
             target_length = self.config.max_position_embeddings
         else:  # dynamic cache
             target_length = (
-                past_seen_tokens + sequence_length
+                attention_mask.shape[-1]
+                if isinstance(attention_mask, torch.Tensor)
+                else past_seen_tokens + sequence_length + 1
             )
 
         causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
@@ -1237,6 +1312,8 @@ class LlamaForCausalLMVLACache(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+        
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1281,6 +1358,7 @@ class LlamaForCausalLMVLACache(LlamaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            **kwargs
         )
 
         hidden_states = outputs[0]

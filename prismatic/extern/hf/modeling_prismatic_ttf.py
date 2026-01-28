@@ -332,6 +332,10 @@ class PrismaticVisionBackbone(nn.Module):
                     # 5. Concatenate the final DINO and SigLIP tokens
                     patches = torch.cat([final_tokens_dino, final_tokens_siglip], dim=2)
         manager.update_cache(pixel_values=pixel_values, vision_tokens=patches, shallow_features=current_shallow_features)
+
+        if 'recompute_mask_dino' in locals():
+            return patches, (recompute_mask_dino, recompute_mask_siglip)
+
         return patches
 
 # === Prismatic Projector (nn.Module) Definitions ===
@@ -456,9 +460,13 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         )
 
         # Instantiate LLM Backbone
-        self.language_model = AutoModelForCausalLM.from_config(
+        from .modeling_llama_vlacache import LlamaForCausalLMVLACache
+        self.language_model = LlamaForCausalLMVLACache._from_config(
             config.text_config, attn_implementation=config._attn_implementation
         )
+        # self.language_model = AutoModelForCausalLM.from_config(
+        #     config.text_config, attn_implementation=config._attn_implementation
+        # )
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = config.pad_token_id
         self.llm_dim = config.text_config.hidden_size
@@ -549,6 +557,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             patch_features = self.vision_backbone(pixel_values, language_embeddings)  # (bsz, 256 * num_images, D)
         else:
             patch_features = self.vision_backbone(pixel_values)  # (bsz, 256 * num_images, D)
+
+        if isinstance(patch_features, tuple):
+            patch_features, other = patch_features
+            return self.projector(patch_features), other
 
         # Project patch embeddings into language embedding space
         return self.projector(patch_features)
@@ -1024,7 +1036,7 @@ class OpenVLAForActionPredictionTTF(PrismaticForConditionalGeneration):
         last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
         actions_hidden_states = last_hidden_states[
             :,
-            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+            - ACTION_DIM * NUM_ACTIONS_CHUNK - 2 : -2,
             :,
         ]  # (B, act_chunk_len, D)
 
@@ -1112,6 +1124,13 @@ class OpenVLAForActionPredictionTTF(PrismaticForConditionalGeneration):
 
         # Process vision features
         projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        self.language_model.model.config.proportion_attn_var = None
+        if isinstance(projected_patch_embeddings, tuple):
+            projected_patch_embeddings, (recompute_mask_dino, recompute_mask_siglip) = projected_patch_embeddings
+            reusable_mask = (~recompute_mask_dino) & (~recompute_mask_siglip)
+            self.language_model.model.config.reusable_patches  = reusable_mask.nonzero().squeeze() + 1
+        else:
+            self.language_model.model.config.reusable_patches = None
 
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
