@@ -300,6 +300,8 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         model_cls = OpenVLAForActionPredictionFlashVLA
     elif cfg.baseline == "none":
         model_cls = OpenVLAForActionPrediction
+    elif cfg.baseline == "base":
+        model_cls = OpenVLAForActionPrediction
     else:
         raise
 
@@ -811,6 +813,7 @@ def get_vla_action(
                 prev_attn = last_caches['attentions'] if last_caches is not None else None
                 mask_indices = None
                 vla.language_model.config.proportion_attn_var = None
+                vla.language_model.config.reusable_patches = None
                 # print(">> VLA-Cache inference mode")
                 # Step 1: Identify visually stable patches across frames
                 if prompt_cache is not None:
@@ -849,7 +852,7 @@ def get_vla_action(
             proprio = obs["state"]
 
         # Generate action
-        if cfg.baseline == "vlacache":
+        if False:
             from vla_modules.calflops import calculate_flops
             (action, _, cache ), (flops, macs, params) = calculate_flops(model=vla, 
                                           kwargs=dict(

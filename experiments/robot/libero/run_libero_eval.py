@@ -327,6 +327,8 @@ def run_episode(
         max_cache_steps = 10000000
     elif cfg.baseline == "base":
         max_cache_steps = 0
+        model.config.static_ratio = 0
+        model.config.use_cache_gate = False
     else:
         max_cache_steps = 0
     cache_steps = 0
