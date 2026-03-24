@@ -522,8 +522,8 @@ def run_forward_pass(
                 if isinstance(static, list) or isinstance(static, tuple):
                     nce_loss = 0.0
                     for _other_static in other_static:
-                        for cs, os in zip(static, _other_static):
-                            nce_loss += get_nce_loss(cs['features'], os['features']) / len(other_static) / len(os)
+                        for i, (cs, os) in enumerate(zip(static, _other_static)):
+                            nce_loss += [2, 1][i] * get_nce_loss(cs['features'], os['features']) / len(other_static) / len(os)
                 else:
                     nce_loss = get_nce_loss(static['features'], other_static['features'])
                 metrics['nce_loss'] = nce_loss.item()
@@ -868,36 +868,46 @@ def run_validation(
     # List to store validation metrics
     all_val_metrics = []
 
-    with torch.no_grad():
-        for batch in val_dataloader:
-            # Always compute L1 loss for validation, even for diffusion
-            _, metrics = run_forward_pass(
-                vla=vla,
-                action_head=action_head,
-                noisy_action_projector=noisy_action_projector,
-                proprio_projector=proprio_projector,
-                batch=batch,
-                action_tokenizer=action_tokenizer,
-                device_id=device_id,
-                use_l1_regression=cfg.use_l1_regression,
-                use_diffusion=cfg.use_diffusion,
-                use_proprio=cfg.use_proprio,
-                use_film=cfg.use_film,
-                num_patches=num_patches,
-                compute_diffusion_l1=True,
-                num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
-                use_contrastive=cfg.use_contrastive,
-                use_cache_gate=cfg.use_cache_gate,
-            )
+    max_val_steps = 1000
+    with tqdm.tqdm(
+        total=max_val_steps,
+        desc="Validation",
+        disable=not distributed_state.is_main_process,
+    ) as pbar:
+        with torch.no_grad():
+            for batch in val_dataloader:
+                # Always compute L1 loss for validation, even for diffusion
+                _, metrics = run_forward_pass(
+                    vla=vla,
+                    action_head=action_head,
+                    noisy_action_projector=noisy_action_projector,
+                    proprio_projector=proprio_projector,
+                    batch=batch,
+                    action_tokenizer=action_tokenizer,
+                    device_id=device_id,
+                    use_l1_regression=cfg.use_l1_regression,
+                    use_diffusion=cfg.use_diffusion,
+                    use_proprio=cfg.use_proprio,
+                    use_film=cfg.use_film,
+                    num_patches=num_patches,
+                    compute_diffusion_l1=True,
+                    num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                    use_contrastive=cfg.use_contrastive,
+                    use_cache_gate=cfg.use_cache_gate,
+                )
 
-            # Add the loss value to the metrics
-            metrics["loss"] = metrics["loss_value"]
-            all_val_metrics.append(metrics)
-            val_batches_count += 1
+                # Add the loss value to the metrics
+                metrics["loss"] = metrics["loss_value"]
+                all_val_metrics.append(metrics)
+                val_batches_count += 1
+                pbar.update(1)
 
-            # Cut testing on validation set short if it exceeds time limit
-            if time.time() - val_start_time > val_time_limit:
-                break
+                # Cut testing on validation set short if it exceeds time limit
+                if time.time() - val_start_time > val_time_limit:
+                    break
+
+                if val_batches_count > max_val_steps:
+                    break
 
     # Compute average validation metrics
     avg_val_metrics = {}
@@ -908,7 +918,7 @@ def run_validation(
 
     # Add batch count to metrics
     avg_val_metrics["val_batches_count"] = val_batches_count
-
+    import ipdb; ipdb.set_trace()
     # Log validation metrics to W&B
     if distributed_state.is_main_process:
         log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
@@ -1249,8 +1259,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             resize_resolution=tuple(vla.module.config.image_sizes),
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
-            train=False,
-            disentangle=cfg.static_ratio > 0.0,
+            disentangle=isinstance(cfg.static_ratio, list) or cfg.static_ratio > 0.0,
+            with_memory=cfg.with_memory,
+            train=True,
             backward_window_size=cfg.backward_window_size,
         )
 
