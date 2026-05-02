@@ -772,9 +772,12 @@ def get_vla_action(
     with torch.inference_mode():
 
         # Collect all input images
-        all_images = [obs["full_image"]]
-        if cfg.num_images_in_input > 1:
-            all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
+        if getattr(cfg, "use_wrist_image", False):
+            all_images = [obs["wrist_image"]]
+        else:
+            all_images = [obs["full_image"]]
+            if cfg.num_images_in_input > 1:
+                all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
 
         # Process images
         all_images = prepare_images_for_vla(all_images, cfg)
@@ -816,7 +819,7 @@ def get_vla_action(
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
             action, _, cache = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False, cache=cache)
-        else:
+        else:   
             # Custom action head for continuous actions
             action, _, cache = vla.predict_action(
                 **inputs,
@@ -829,6 +832,22 @@ def get_vla_action(
                 use_film=use_film,
                 cache=cache,
             )
+            # from calflops import calculate_flops
+            # kwargs = dict(
+            #     **inputs,
+            #     unnorm_key=cfg.unnorm_key,
+            #     do_sample=False,
+            #     proprio=proprio,
+            #     proprio_projector=proprio_projector,
+            #     noisy_action_projector=noisy_action_projector,
+            #     action_head=action_head,
+            #     use_film=use_film,
+            #     cache=cache,
+            # )
+            # (action, _, cache), (flops, macs, params) = calculate_flops(model=vla, 
+            #                 kwargs=kwargs,
+            #                 output_as_string=False,)
+            # import ipdb; ipdb.set_trace()
 
     # Return action chunk as list of actions
     return [action[i] for i in range(len(action))], cache
