@@ -96,10 +96,15 @@ class GenerateConfig:
     num_diffusion_steps_inference: int = 50          # (When `diffusion==True`) Number of diffusion steps used for inference
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
+    use_wrist_image: bool = False                    # If True, use wrist image as the primary VLA input (otherwise use full third-person image)
     use_proprio: bool = True                         # Whether to include proprio state in input
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
     num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
+
+    use_action_ensemble: bool = False                # If True, requery model every step and ensemble predictions for the current timestep across recent past chunks (SpatialVLA-style)
+    action_ensemble_temp: float = 0.0                # Exponential weight temperature for ensemble (0.0 = uniform mean over history; >0 down-weights older predictions; <0 up-weights older)
+    action_ensemble_horizon: int = 0                 # Max number of past chunks to ensemble over. 0 means use NUM_ACTIONS_CHUNK.
 
     lora_rank: int = 32                              # Rank of LoRA weight matrix (MAKE SURE THIS MATCHES TRAINING!)
 
@@ -285,6 +290,36 @@ def get_bounded_from_index(data, index):
     return data[index]
 
 
+class ActionEnsembler:
+    """Ensembles per-timestep action predictions made across recent past chunks.
+
+    At step t, the model emits a chunk of K actions (a_t, a_{t+1}, ..., a_{t+K-1}).
+    For the current timestep we have up to K predictions: the one made at t (offset 0),
+    at t-1 (offset 1), ..., at t-(K-1) (offset K-1). We average them with exponential
+    weights w_i = exp(-temp * i), normalized to sum to 1. temp == 0 yields a uniform mean.
+    Mirrors the scheme used in SpatialVLA.
+    """
+
+    def __init__(self, pred_action_horizon: int, action_ensemble_temp: float = 0.0):
+        self.pred_action_horizon = pred_action_horizon
+        self.action_ensemble_temp = action_ensemble_temp
+        self.action_history = deque(maxlen=pred_action_horizon)
+
+    def reset(self):
+        self.action_history.clear()
+
+    def ensemble_action(self, cur_action_chunk: np.ndarray) -> np.ndarray:
+        self.action_history.append(np.asarray(cur_action_chunk))
+        num_chunks = len(self.action_history)
+        # For each past chunk i (0 = newest), pick the action it predicted for the current step
+        curr_act_preds = np.stack(
+            [chunk[i] for i, chunk in zip(range(num_chunks), reversed(self.action_history))]
+        )
+        weights = np.exp(-self.action_ensemble_temp * np.arange(num_chunks))
+        weights = weights / weights.sum()
+        return np.sum(weights[:, None] * curr_act_preds, axis=0)
+
+
 def run_episode(
     cfg: GenerateConfig,
     env,
@@ -308,12 +343,22 @@ def run_episode(
     else:
         obs = env.get_observation()
 
-    # Initialize action queue
-    if cfg.num_open_loop_steps != NUM_ACTIONS_CHUNK:
-        print(f"WARNING: cfg.num_open_loop_steps ({cfg.num_open_loop_steps}) does not match the NUM_ACTIONS_CHUNK "
-              f"({NUM_ACTIONS_CHUNK}) constant defined in prismatic.vla.constants! For best performance (in terms of "
-               "both speed and success rate), we recommend executing the full action chunk.")
-    action_queue = deque(maxlen=cfg.num_open_loop_steps)
+    # Initialize action queue / ensembler
+    action_ensembler = None
+    if cfg.use_action_ensemble:
+        horizon = cfg.action_ensemble_horizon if cfg.action_ensemble_horizon > 0 else NUM_ACTIONS_CHUNK
+        horizon = min(horizon, NUM_ACTIONS_CHUNK)
+        action_ensembler = ActionEnsembler(
+            pred_action_horizon=horizon,
+            action_ensemble_temp=cfg.action_ensemble_temp,
+        )
+        action_queue = None
+    else:
+        if cfg.num_open_loop_steps != NUM_ACTIONS_CHUNK:
+            print(f"WARNING: cfg.num_open_loop_steps ({cfg.num_open_loop_steps}) does not match the NUM_ACTIONS_CHUNK "
+                  f"({NUM_ACTIONS_CHUNK}) constant defined in prismatic.vla.constants! For best performance (in terms of "
+                   "both speed and success rate), we recommend executing the full action chunk.")
+        action_queue = deque(maxlen=cfg.num_open_loop_steps)
 
     # Setup
     t = 0
@@ -341,12 +386,13 @@ def run_episode(
         replay_images.append(img)
         replay_observations.append(deepcopy(observation))
 
-        # If action queue is empty, requery model
-        if len(action_queue) == 0:
+        # Decide whether to query the model this step
+        need_query = action_ensembler is not None or len(action_queue) == 0
+        if need_query:
             # history_index = -1 if cache is None else -17
             # observation = {'full_image': get_bounded_from_index(replay_observations, history_index)['full_image']}
             # history_image = get_bounded_from_index(replay_observations, history_index)['full_image']
-            # Query model to get action
+            # Query model to get action chunk
             actions, cache = get_action(
                 cfg,
                 model,
@@ -360,14 +406,18 @@ def run_episode(
                 # history_image=model.history_image,
                 cache=cache,
             )
-            action_queue.extend(actions)
             cache_steps += 1
             if cache_steps >= max_cache_steps:
                 cache_steps = 0
                 cache = None
+            if action_ensembler is None:
+                action_queue.extend(actions)
 
-        # Get action from queue
-        action = action_queue.popleft()
+        # Get action for the current step
+        if action_ensembler is not None:
+            action = action_ensembler.ensemble_action(np.asarray(actions))
+        else:
+            action = action_queue.popleft()
 
         # Process action
         action = process_action(action, cfg.model_family)
